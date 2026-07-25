@@ -6,6 +6,7 @@ from PIL import Image
 from game_window_ocr.cli import clean_ocr_text, parse_crop, prepare_ocr_image
 from game_window_ocr.commentary import (
     CommentaryPlan,
+    apply_commentary_cooldown,
     build_commentary_prompt,
     build_commentary_speech_prompt,
     build_narration_prompt,
@@ -81,7 +82,7 @@ def test_narration_prompt_collapses_visual_line_wraps() -> None:
 
 
 def test_commentary_prompt_limits_length_and_repetition() -> None:
-    prompt = build_commentary_prompt("雪が降っていた。")
+    prompt = build_commentary_prompt("雪が降っていた。", turns_since_spoken=1)
     assert '"new_game_text": "雪が降っていた。"' in prompt
     assert "silent" in prompt
     assert "reaction" in prompt
@@ -91,12 +92,40 @@ def test_commentary_prompt_limits_length_and_repetition() -> None:
     assert '"mode":"silent"' in prompt
     assert "〜なんだよね〜" in prompt
     assert "同じ相づち・冒頭・語尾を連続させず" in prompt
+    assert "70～80%程度をsilent" in prompt
+    assert '"turns_since_spoken": 1' in prompt
 
 
 def test_extract_incremental_text_returns_only_appended_screen_text() -> None:
     previous = "ぼくは真理を見つめた。"
     current = "ぼくは真理を見つめた。\n彼女は注目の的だった。"
     assert extract_incremental_text(previous, current) == "彼女は注目の的だった。"
+
+
+def test_extract_incremental_text_ignores_ocr_whitespace_changes() -> None:
+    previous = (
+        "真理とは、今年の四月に大学で知り合った。\n"
+        "果敢かつ執ようなアタックで、何度かデートをする\n"
+        "関係にまでこぎつけることができたのは、この秋の\n"
+        "ことだ。"
+    )
+    current = (
+        "真理とは、今年の四月に大学で知り合った。\n"
+        "果敢かつ執ようなアタックで、 何度かデートをする\n"
+        "関係にまでこぎつけることができたのは、この秋の\n"
+        "ことだ。\n"
+        "しかし、 押しても押しても手応えがなかった。"
+    )
+    assert extract_incremental_text(previous, current) == (
+        "しかし、 押しても押しても手応えがなかった。"
+    )
+
+
+def test_extract_incremental_text_returns_empty_for_whitespace_only_change() -> None:
+    assert extract_incremental_text(
+        "アタックで、何度かデートをした。",
+        "アタックで、　何度かデートをした。",
+    ) == ""
 
 
 def test_extract_incremental_text_keeps_replaced_screen_text() -> None:
@@ -157,6 +186,49 @@ def test_commentary_plan_issue_rejects_long_reaction() -> None:
         pace="fast",
     )
     assert "上限12文字" in (commentary_plan_issue(plan) or "")
+
+
+def test_commentary_cooldown_suppresses_quick_for_two_turns() -> None:
+    plan = CommentaryPlan(
+        comment="へぇ、そうなんだ。",
+        mode="quick",
+        emotion="calm",
+        intensity=0.3,
+        pace="normal",
+    )
+    suppressed, reason = apply_commentary_cooldown(
+        plan,
+        turns_since_spoken=2,
+    )
+    assert suppressed.mode == "silent"
+    assert suppressed.comment == ""
+    assert reason == "quick_cooldown_after_2_turns"
+
+
+def test_commentary_cooldown_keeps_reaction_and_major_commentary() -> None:
+    reaction = CommentaryPlan(
+        comment="うわっ！",
+        mode="reaction",
+        emotion="surprised",
+        intensity=0.8,
+        pace="fast",
+    )
+    assert apply_commentary_cooldown(
+        reaction,
+        turns_since_spoken=1,
+    ) == (reaction, None)
+
+    extended = CommentaryPlan(
+        comment="あ、これ証言と食い違ってるじゃん。アリバイが崩れたかも。",
+        mode="extended",
+        emotion="thoughtful",
+        intensity=0.7,
+        pace="normal",
+    )
+    assert apply_commentary_cooldown(
+        extended,
+        turns_since_spoken=1,
+    ) == (extended, None)
 
 
 def test_commentary_plan_issue_rejects_long_quick_comment() -> None:

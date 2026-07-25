@@ -88,10 +88,15 @@ def build_narration_prompt(text: str) -> str:
     )
 
 
-def build_commentary_prompt(text: str) -> str:
+def build_commentary_prompt(
+    text: str,
+    *,
+    turns_since_spoken: int | None = None,
+) -> str:
     payload = {
         "new_game_text": collapse_visual_line_breaks(text),
         "task": "commentary",
+        "turns_since_spoken": turns_since_spoken,
     }
     return (
         "# Role\n"
@@ -109,6 +114,12 @@ def build_commentary_prompt(text: str) -> str:
         "人物関係を覆す事実。最大2文・合計90文字。\n"
         "- モードを順番に回したり、無理に変化を付けたりしない。"
         "extendedは本当に重要な時だけ使う。\n\n"
+        "# Cadence\n"
+        "- 文字送りが細かいゲームなので、通常時は全ターンの70～80%程度をsilentにする。\n"
+        "- ひとつの場面を細切れにしただけの追加文では、意味がまとまるまでsilentで待つ。\n"
+        "- turns_since_spokenが1または2なら、quickではなくsilentにする。"
+        "ただし突然の驚きに対するreactionと、本当に重大なextendedは出してよい。\n"
+        "- 発話する価値があるか少しでも迷ったらsilent。沈黙を不自然だと考えない。\n\n"
         "# Style\n"
         "- 友達と隣で遊んでいる若い成人のような、くだけた自然な口調で話す。"
         "丁寧語より普段の会話を優先する。\n"
@@ -286,13 +297,41 @@ def commentary_plan_issue(plan: CommentaryPlan) -> str | None:
     return None
 
 
+def apply_commentary_cooldown(
+    plan: CommentaryPlan,
+    *,
+    turns_since_spoken: int | None,
+) -> tuple[CommentaryPlan, str | None]:
+    if (
+        plan.mode != "quick"
+        or turns_since_spoken is None
+        or turns_since_spoken > 2
+    ):
+        return plan, None
+    return (
+        CommentaryPlan(
+            comment="",
+            mode="silent",
+            emotion="calm",
+            intensity=0.0,
+            pace="normal",
+        ),
+        f"quick_cooldown_after_{turns_since_spoken}_turns",
+    )
+
+
 def build_commentary_revision_prompt(
     text: str,
     plan: CommentaryPlan,
     issue: str,
+    *,
+    turns_since_spoken: int | None = None,
 ) -> str:
     return (
-        build_commentary_prompt(text)
+        build_commentary_prompt(
+            text,
+            turns_since_spoken=turns_since_spoken,
+        )
         + "\n\n# Revision required\n"
         + f"直前の案は不採用です。理由: {issue}。\n"
         + "意味を短く切り落とすだけでなく、ゲームを遊んでいる本人の自然な一言として"
@@ -343,15 +382,32 @@ def collapse_visual_line_breaks(text: str) -> str:
     return "".join(line.strip() for line in text.splitlines())
 
 
+def _prefix_end_ignoring_whitespace(prefix: str, text: str) -> int | None:
+    compact_prefix = "".join(char for char in prefix if not char.isspace())
+    compact_text = "".join(char for char in text if not char.isspace())
+    if not compact_text.startswith(compact_prefix):
+        return None
+    if not compact_prefix:
+        return 0
+
+    matched_characters = 0
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        matched_characters += 1
+        if matched_characters == len(compact_prefix):
+            return index + 1
+    return None
+
+
 def extract_incremental_text(previous_text: str | None, current_text: str) -> str:
     current = collapse_visual_line_breaks(current_text)
     if not previous_text:
         return current
     previous = collapse_visual_line_breaks(previous_text)
-    if current.startswith(previous):
-        added = current[len(previous) :].strip()
-        if added:
-            return added
+    prefix_end = _prefix_end_ignoring_whitespace(previous, current)
+    if prefix_end is not None:
+        return current[prefix_end:].strip()
     return current
 
 
@@ -785,6 +841,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             last_text: str | None = None
+            last_spoken_turn: int | None = None
             for turn_number in range(1, turns + 1):
                 turn_dir = root / f"turn_{turn_number:03d}"
                 turn_dir.mkdir(parents=True, exist_ok=True)
@@ -806,6 +863,10 @@ def main(argv: list[str] | None = None) -> int:
 
                 print(f"\n[{turn_number}/{turns}] OCR本文:\n{text}")
                 turn_text = extract_incremental_text(last_text, text)
+                if not turn_text:
+                    raise RuntimeError(
+                        "空白を除くと前の画面と同じ本文です。Enterは送りません。"
+                    )
                 if turn_text != collapse_visual_line_breaks(text):
                     print(f"今回追加された本文:\n{turn_text}")
                 if not args.narration_only:
@@ -829,18 +890,30 @@ def main(argv: list[str] | None = None) -> int:
                 commentary: SpeechResult | None = None
                 commentary_plan: CommentaryPlan | None = None
                 commentary_plan_response: TextResult | None = None
+                commentary_suppressed_reason: str | None = None
                 if not args.narration_only:
+                    turns_since_spoken = (
+                        None
+                        if last_spoken_turn is None
+                        else turn_number - last_spoken_turn
+                    )
                     print("感想と演技を決めています...")
                     commentary_plan_response = planner.generate_text(
                         phase="commentary_plan",
-                        instructions=build_commentary_prompt(turn_text),
+                        instructions=build_commentary_prompt(
+                            turn_text,
+                            turns_since_spoken=turns_since_spoken,
+                        ),
                         use_conversation_history=True,
                     )
                     if not commentary_plan_response.text:
                         print("警告: 感想計画が空だったため、1回だけ再生成します。")
                         commentary_plan_response = planner.generate_text(
                             phase="commentary_plan_retry",
-                            instructions=build_commentary_prompt(turn_text),
+                            instructions=build_commentary_prompt(
+                                turn_text,
+                                turns_since_spoken=turns_since_spoken,
+                            ),
                             use_conversation_history=True,
                         )
                     if not commentary_plan_response.text:
@@ -864,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
                                 turn_text,
                                 commentary_plan,
                                 plan_issue,
+                                turns_since_spoken=turns_since_spoken,
                             ),
                             use_conversation_history=True,
                         )
@@ -877,8 +951,19 @@ def main(argv: list[str] | None = None) -> int:
                         plan_issue = commentary_plan_issue(commentary_plan)
                     if plan_issue is not None:
                         print(f"警告: 感想案の品質条件を満たせませんでした: {plan_issue}")
+                    commentary_plan, commentary_suppressed_reason = (
+                        apply_commentary_cooldown(
+                            commentary_plan,
+                            turns_since_spoken=turns_since_spoken,
+                        )
+                    )
+                    if commentary_suppressed_reason:
+                        print(
+                            "発話間隔を空けるため、quickをsilentへ変更しました。"
+                        )
                     plan_record = {
                         **asdict(commentary_plan),
+                        "suppressed_reason": commentary_suppressed_reason,
                         "raw_response": commentary_plan_response.text,
                         "response_id": commentary_plan_response.response_id,
                     }
@@ -910,6 +995,7 @@ def main(argv: list[str] | None = None) -> int:
                             encoding="utf-8",
                         )
                         print(f"実況: {commentary.transcript}")
+                        last_spoken_turn = turn_number
 
                 summary = {
                     "model": args.model,
@@ -922,6 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
                     "commentary_plan": (
                         {
                             **asdict(commentary_plan),
+                            "suppressed_reason": commentary_suppressed_reason,
                             "raw_response": commentary_plan_response.text,
                             "response_id": commentary_plan_response.response_id,
                         }
