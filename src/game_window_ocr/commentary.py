@@ -12,6 +12,7 @@ import wave
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -35,6 +36,7 @@ from .windows import (
     enable_dpi_awareness,
     find_window,
     press_enter,
+    select_choice,
 )
 
 
@@ -43,6 +45,9 @@ DEFAULT_COMMENTARY_MODEL = "gpt-realtime-2.1"
 DEFAULT_VOICE = "marin"
 SAMPLE_RATE = 24_000
 COMMENTARY_PLAN_REVISIONS = 3
+CHOICE_PLAN_REVISIONS = 3
+CHOICE_PROBE_INTERVAL = 1.0
+CHOICE_SPEECH_SIMILARITY_THRESHOLD = 0.88
 MARKER_REFERENCE_SIZE = (960, 540)
 MARKER_MATCH_THRESHOLD = 0.78
 TRIANGLE_CONTOUR_SCORE = 0.90
@@ -142,6 +147,30 @@ class CommentaryPlan:
 
 
 @dataclass(frozen=True)
+class ChoiceOption:
+    label: str
+    text: str
+
+
+@dataclass(frozen=True)
+class ChoicePlan:
+    selected_label: str
+    opinion: str
+    emotion: str
+    intensity: float
+    pace: str
+
+
+@dataclass(frozen=True)
+class ChoiceSpeechVerification:
+    matches: bool
+    exact: bool
+    similarity: float
+    selection_declared: bool
+    reason: str | None
+
+
+@dataclass(frozen=True)
 class AdvanceMarker:
     kind: str
     score: float
@@ -155,6 +184,40 @@ COMMENTARY_EMOTIONS = frozenset(
 )
 COMMENTARY_PACES = frozenset({"slow", "normal", "fast"})
 COMMENTARY_MODES = frozenset({"silent", "reaction", "quick", "extended"})
+
+_CHOICE_LINE_PATTERN = re.compile(
+    r"^\s*[-‐‑‒–—―ー・>＞〉》→▶▷▸►]*\s*"
+    r"([A-ZＡ-Ｚ])\s*[:：]\s*(.*)$"
+)
+
+_SPOKEN_CHOICE_LABELS = {
+    "A": "エー",
+    "B": "ビー",
+    "C": "シー",
+    "D": "ディー",
+    "E": "イー",
+    "F": "エフ",
+    "G": "ジー",
+    "H": "エイチ",
+    "I": "アイ",
+    "J": "ジェー",
+    "K": "ケー",
+    "L": "エル",
+    "M": "エム",
+    "N": "エヌ",
+    "O": "オー",
+    "P": "ピー",
+    "Q": "キュー",
+    "R": "アール",
+    "S": "エス",
+    "T": "ティー",
+    "U": "ユー",
+    "V": "ブイ",
+    "W": "ダブリュー",
+    "X": "エックス",
+    "Y": "ワイ",
+    "Z": "ゼット",
+}
 
 
 def _marker_template(rows: tuple[str, ...]) -> np.ndarray:
@@ -356,6 +419,179 @@ def wait_for_advance_marker_with_retries(
             f"（{retry_count}/{retry_label}、Ctrl+Cで停止）。"
         )
         time.sleep(retry_delay)
+
+
+def extract_choice_options(text: str) -> tuple[ChoiceOption, ...]:
+    """Extract an A:, B:, C: ... menu from OCR text."""
+    options: list[ChoiceOption] = []
+    current_label: str | None = None
+    current_lines: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = unicodedata.normalize("NFKC", raw_line).strip()
+        match = _CHOICE_LINE_PATTERN.match(line)
+        if match:
+            if current_label is not None:
+                options.append(
+                    ChoiceOption(
+                        label=current_label,
+                        text=collapse_visual_line_breaks("\n".join(current_lines)),
+                    )
+                )
+            current_label = match.group(1).upper()
+            current_lines = [match.group(2).strip()]
+        elif current_label is not None and line:
+            current_lines.append(line)
+
+    if current_label is not None:
+        options.append(
+            ChoiceOption(
+                label=current_label,
+                text=collapse_visual_line_breaks("\n".join(current_lines)),
+            )
+        )
+
+    if len(options) < 2:
+        return ()
+    expected_labels = [
+        chr(ord("A") + index)
+        for index in range(len(options))
+    ]
+    if [option.label for option in options] != expected_labels:
+        return ()
+    if any(not option.text for option in options):
+        return ()
+    return tuple(options)
+
+
+def build_choice_prompt(options: tuple[ChoiceOption, ...]) -> str:
+    payload = {
+        "task": "choose_game_option",
+        "options": [asdict(option) for option in options],
+    }
+    labels = ", ".join(option.label for option in options)
+    return (
+        "# Role\n"
+        "あなたは初見プレイ中の自然体な日本語ゲーム実況者です。"
+        "過去の展開と表示中の選択肢を踏まえ、自分が見たい展開を率直に選びます。\n\n"
+        "# Choice\n"
+        f"- selected_labelは必ず次のいずれかを1つ選ぶ: {labels}\n"
+        "- 正解探しだけに偏らず、人物への共感、面白そうな展開、直感などから"
+        "実況者本人として決める。\n"
+        "- optionsにない出来事や設定を作らない。\n\n"
+        "# Opinion\n"
+        "- opinionには、選択肢への意見、理由、期待、ツッコミのいずれかを"
+        "自然な1～2文・8～70文字で書く。本文の単なる復唱や要約は禁止。\n"
+        "- opinionには『Aを選ぶ』『Bにする』などの選択宣言を書かない。"
+        "選択宣言はプログラムがこの発言の後ろへ必ず追加する。\n"
+        "- 仲のいい友達と隣で遊んでいる20代くらいの女性のような、"
+        "明るく親しみやすい普段の話し方にする。\n\n"
+        "# Delivery\n"
+        "- emotionは calm/amused/excited/surprised/tense/sad/thoughtful "
+        "から選ぶ。\n"
+        "- intensityは0.0～1.0、paceはslow/normal/fastから選ぶ。\n"
+        "- JSONオブジェクトだけを出力する。\n"
+        '{"selected_label":"B","opinion":"この強がり、あとで絶対面白くなりそう。",'
+        '"emotion":"amused","intensity":0.7,"pace":"normal"}\n\n'
+        + json.dumps(payload, ensure_ascii=False)
+    )
+
+
+def parse_choice_plan(raw_text: str) -> ChoicePlan:
+    raw = raw_text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    candidate = fenced.group(1) if fenced else raw
+    if "{" in candidate and "}" in candidate:
+        candidate = candidate[candidate.find("{") : candidate.rfind("}") + 1]
+    try:
+        payload: Any = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    selected_label = unicodedata.normalize(
+        "NFKC",
+        str(payload.get("selected_label", "")),
+    ).strip().upper()
+    if not re.fullmatch(r"[A-Z]", selected_label):
+        selected_label = ""
+    opinion = str(payload.get("opinion", payload.get("comment", ""))).strip()
+    emotion = str(payload.get("emotion", "thoughtful")).strip().casefold()
+    if emotion not in COMMENTARY_EMOTIONS:
+        emotion = "thoughtful"
+    try:
+        intensity = float(payload.get("intensity", 0.6))
+    except (TypeError, ValueError):
+        intensity = 0.6
+    intensity = min(1.0, max(0.0, intensity))
+    pace = str(payload.get("pace", "normal")).strip().casefold()
+    if pace == "medium":
+        pace = "normal"
+    if pace not in COMMENTARY_PACES:
+        pace = "normal"
+    return ChoicePlan(
+        selected_label=selected_label,
+        opinion=opinion,
+        emotion=emotion,
+        intensity=max(0.55, intensity),
+        pace=pace,
+    )
+
+
+def choice_plan_issue(
+    plan: ChoicePlan,
+    options: tuple[ChoiceOption, ...],
+) -> str | None:
+    labels = {option.label for option in options}
+    if plan.selected_label not in labels:
+        return "selected_labelが表示中の選択肢にありません"
+    if len(plan.opinion) < 8:
+        return f"opinionが8文字未満です（{len(plan.opinion)}文字）"
+    if len(plan.opinion) > 70:
+        return f"opinionが70文字を超えています（{len(plan.opinion)}文字）"
+    if re.search(
+        r"(?:[A-ZＡ-Ｚ]\s*(?:を|に)\s*(?:選|する)|"
+        r"(?:選ぶ|選びます|選ぼう|にする|でいく))",
+        plan.opinion,
+        re.IGNORECASE,
+    ):
+        return "opinionに選択宣言が含まれています"
+    return None
+
+
+def build_choice_revision_prompt(
+    options: tuple[ChoiceOption, ...],
+    plan: ChoicePlan,
+    issue: str,
+) -> str:
+    return (
+        build_choice_prompt(options)
+        + "\n\n# Revision required\n"
+        + f"直前の案は不採用です。理由: {issue}。\n"
+        + "同じ選択肢から選び直し、条件をすべて満たすJSONだけを返してください。\n"
+        + "直前の案: "
+        + json.dumps(asdict(plan), ensure_ascii=False)
+    )
+
+
+def choice_utterance(plan: ChoicePlan) -> str:
+    opinion = plan.opinion.strip()
+    if not re.search(r"[。！？!?…〜～ー]$", opinion):
+        opinion += "。"
+    return f"{opinion} ここは{plan.selected_label}を選ぶね。"
+
+
+def build_choice_speech_prompt(plan: ChoicePlan) -> str:
+    return build_commentary_speech_prompt(
+        CommentaryPlan(
+            comment=choice_utterance(plan),
+            mode="quick",
+            emotion=plan.emotion,
+            intensity=plan.intensity,
+            pace=plan.pace,
+        )
+    )
 
 
 def build_narration_prompt(text: str) -> str:
@@ -796,8 +1032,86 @@ def normalize_spoken_text(text: str) -> str:
     )
 
 
+def normalize_spoken_variants(text: str) -> str:
+    normalized = normalize_spoken_text(text)
+    for variant in ("良い", "善い", "好い"):
+        normalized = normalized.replace(variant, "いい")
+    return normalized
+
+
 def narration_matches(source: str, transcript: str) -> bool:
-    return normalize_spoken_text(source) == normalize_spoken_text(transcript)
+    return normalize_spoken_variants(source) == normalize_spoken_variants(
+        transcript
+    )
+
+
+def _normalize_choice_verification_text(text: str) -> str:
+    normalized = normalize_spoken_variants(text)
+    for label, reading in _SPOKEN_CHOICE_LABELS.items():
+        normalized_label = label.casefold()
+        for ending in ("を選ぶ", "にする", "でいく"):
+            normalized = normalized.replace(
+                reading + ending,
+                normalized_label + ending,
+            )
+    return normalized
+
+
+def verify_choice_speech(
+    plan: ChoicePlan,
+    transcript: str,
+) -> ChoiceSpeechVerification:
+    utterance = choice_utterance(plan)
+    exact = normalize_spoken_text(utterance) == normalize_spoken_text(transcript)
+    expected = _normalize_choice_verification_text(utterance)
+    actual = _normalize_choice_verification_text(transcript)
+    similarity = (
+        SequenceMatcher(None, expected, actual).ratio()
+        if expected or actual
+        else 1.0
+    )
+    label = plan.selected_label.casefold()
+    declaration_patterns = (
+        f"ここは{label}を選ぶ",
+        f"ここは{label}にする",
+        f"{label}を選ぶ",
+        f"{label}にする",
+        f"{label}でいく",
+    )
+    declaration_locations = [
+        actual.rfind(pattern)
+        for pattern in declaration_patterns
+        if pattern in actual
+    ]
+    declaration_location = (
+        max(declaration_locations)
+        if declaration_locations
+        else -1
+    )
+    opinion_precedes = declaration_location >= 4
+    selection_declared = declaration_location >= 0 and opinion_precedes
+
+    reason: str | None = None
+    if not transcript.strip():
+        reason = "発話転写が空です"
+    elif declaration_location < 0:
+        reason = f"選択先{plan.selected_label}の宣言を確認できません"
+    elif not opinion_precedes:
+        reason = "選択宣言より前の意見を確認できません"
+    elif similarity < CHOICE_SPEECH_SIMILARITY_THRESHOLD:
+        reason = (
+            "予定文との類似度が低すぎます"
+            f"（{similarity:.3f} < "
+            f"{CHOICE_SPEECH_SIMILARITY_THRESHOLD:.3f}）"
+        )
+
+    return ChoiceSpeechVerification(
+        matches=reason is None,
+        exact=exact,
+        similarity=similarity,
+        selection_declared=selection_declared,
+        reason=reason,
+    )
 
 
 class AudioSink:
@@ -1057,6 +1371,51 @@ class RealtimeSpeechClient:
         )
 
 
+def speak_choice_with_retries(
+    realtime: RealtimeSpeechClient,
+    plan: ChoicePlan,
+    *,
+    turn_dir: Path,
+    playback: bool,
+    retries: int,
+    retry_delay: float,
+    allow_mismatch: bool = False,
+) -> tuple[SpeechResult, ChoiceSpeechVerification, int]:
+    retry_count = 0
+    while True:
+        suffix = "" if retry_count == 0 else f"_retry_{retry_count:03d}"
+        speech = realtime.speak(
+            phase="choice" if retry_count == 0 else "choice_retry",
+            instructions=build_choice_speech_prompt(plan),
+            wav_path=turn_dir / f"choice{suffix}.wav",
+            playback=playback,
+            use_conversation_history=False,
+        )
+        (turn_dir / f"choice{suffix}_transcript.txt").write_text(
+            speech.transcript + "\n",
+            encoding="utf-8",
+        )
+        verification = verify_choice_speech(plan, speech.transcript)
+        if verification.matches or allow_mismatch:
+            return speech, verification, retry_count
+
+        retry_count += 1
+        if retries > 0 and retry_count > retries:
+            raise RuntimeError(
+                "選択発話を確認できませんでした"
+                f"（初回 + {retries}回再試行）。"
+                f"最後の理由: {verification.reason}。"
+                "キー入力は行いません。"
+            )
+        retry_label = "無制限" if retries == 0 else str(retries)
+        print(
+            "選択発話を確認できないため再試行します: "
+            f"{verification.reason} / 類似度={verification.similarity:.3f} "
+            f"（{retry_count}/{retry_label}、Ctrl+Cで停止）"
+        )
+        time.sleep(retry_delay)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="OCR本文をRealtimeモデルで朗読し、短い感想を音声再生します。"
@@ -1087,12 +1446,33 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--press-enter",
         action="store_true",
-        help="朗読と感想の再生後、対象ゲームへEnterを送ります。",
+        help=(
+            "朗読と感想の再生後にゲームを進めます。"
+            "選択肢では意見と選択宣言の後に↓とEnterを送ります。"
+        ),
     )
     parser.add_argument(
         "--allow-narration-mismatch",
         action="store_true",
-        help="朗読転写が本文と一致しなくてもEnter送信を許可します（非推奨）。",
+        help=(
+            "朗読または選択発話の転写が予定文と一致しなくても"
+            "キー入力を許可します（非推奨）。"
+        ),
+    )
+    parser.add_argument(
+        "--speech-retries",
+        type=int,
+        default=0,
+        help=(
+            "選択発話の確認失敗時に再試行する回数。"
+            "0（既定値）は成功するまで無制限。"
+        ),
+    )
+    parser.add_argument(
+        "--speech-retry-delay",
+        type=float,
+        default=0.5,
+        help="選択発話を再試行するまでの秒数。",
     )
     parser.add_argument(
         "--narration-only",
@@ -1119,13 +1499,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--marker-timeout",
         type=float,
         default=12.0,
-        help="文字送りの三角・本マークを1回に待つ最大秒数。",
+        help="文字送りの三角・本マークまたは選択肢を1回に待つ最大秒数。",
     )
     parser.add_argument(
         "--marker-retries",
         type=int,
         default=0,
-        help="マーク待機を再試行する回数。0（既定値）は無制限。",
+        help="進行待ちの検出を再試行する回数。0（既定値）は無制限。",
     )
     parser.add_argument(
         "--marker-retry-delay",
@@ -1156,27 +1536,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _capture_and_ocr(
-    window: WindowInfo,
+def _recognize_capture(
+    raw: Image.Image,
     turn_dir: Path,
     args: argparse.Namespace,
     ocr_engine: PersistentNdlOcr,
-) -> tuple[str, AdvanceMarker]:
-    raw, marker = wait_for_advance_marker_with_retries(
-        window,
-        activate=not args.no_activate,
-        timeout=args.marker_timeout,
-        poll_interval=args.marker_poll_interval,
-        threshold=args.marker_threshold,
-        retries=args.marker_retries,
-        retry_delay=args.marker_retry_delay,
-        retry_capture_path=turn_dir / "marker_timeout_latest.png",
-    )
-    print(
-        f"文字送りマーク: {marker.kind} / "
-        f"一致度={marker.score:.3f} / 待機={marker.waited_seconds:.2f}秒 / "
-        f"リトライ={marker.retry_count}回"
-    )
+) -> str:
     raw_path = turn_dir / "capture_raw.png"
     raw.save(raw_path)
     prepared = prepare_ocr_image(raw, crop=args.crop, scale=args.scale)
@@ -1195,6 +1560,95 @@ def _capture_and_ocr(
     (turn_dir / "source.txt").write_text(
         text + ("\n" if text else ""),
         encoding="utf-8",
+    )
+    return text
+
+
+def _capture_and_ocr(
+    window: WindowInfo,
+    turn_dir: Path,
+    args: argparse.Namespace,
+    ocr_engine: PersistentNdlOcr,
+) -> tuple[str, AdvanceMarker]:
+    total_started = time.monotonic()
+    retry_count = 0
+    best_marker = AdvanceMarker("none", 0.0, None)
+    raw: Image.Image | None = None
+    marker = AdvanceMarker("none", 0.0, None)
+    text = ""
+
+    while True:
+        attempt_started = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - attempt_started
+            remaining = args.marker_timeout - elapsed
+            if remaining <= 0:
+                break
+            raw, marker = wait_for_advance_marker(
+                window,
+                activate=not args.no_activate,
+                timeout=min(CHOICE_PROBE_INTERVAL, remaining),
+                poll_interval=args.marker_poll_interval,
+                threshold=args.marker_threshold,
+            )
+            if marker.score > best_marker.score:
+                best_marker = marker
+
+            text = _recognize_capture(raw, turn_dir, args, ocr_engine)
+            options = extract_choice_options(text)
+            if options:
+                marker = AdvanceMarker(
+                    "choices",
+                    1.0,
+                    None,
+                    waited_seconds=time.monotonic() - total_started,
+                    retry_count=retry_count,
+                )
+                print(
+                    "選択肢を検出: "
+                    + ", ".join(option.label for option in options)
+                )
+                break
+            if marker.kind != "none":
+                marker = AdvanceMarker(
+                    marker.kind,
+                    marker.score,
+                    marker.location,
+                    waited_seconds=time.monotonic() - total_started,
+                    retry_count=retry_count,
+                )
+                break
+
+        if marker.kind != "none":
+            break
+
+        if raw is None:
+            raise RuntimeError("ゲーム画面を取得できませんでした。")
+        retry_count += 1
+        raw.save(turn_dir / "marker_timeout_latest.png")
+        if args.marker_retries > 0 and retry_count > args.marker_retries:
+            raise RuntimeError(
+                "文字送りマークまたは選択肢を検出できませんでした"
+                f"（{args.marker_timeout:.1f}秒 × {retry_count}回、"
+                f"最高一致度={best_marker.score:.3f}）。キー入力は行いません。"
+            )
+        retry_label = (
+            "無制限"
+            if args.marker_retries == 0
+            else str(args.marker_retries)
+        )
+        print(
+            "文字送りマークまたは選択肢をまだ検出できません"
+            f"（最高一致度={best_marker.score:.3f}）。"
+            f"{args.marker_retry_delay:.1f}秒後に再試行します"
+            f"（{retry_count}/{retry_label}、Ctrl+Cで停止）。"
+        )
+        time.sleep(args.marker_retry_delay)
+
+    print(
+        f"進行待ちの検出結果: {marker.kind} / "
+        f"一致度={marker.score:.3f} / 待機={marker.waited_seconds:.2f}秒 / "
+        f"リトライ={marker.retry_count}回"
     )
     (turn_dir / "advance_marker.json").write_text(
         json.dumps(asdict(marker), ensure_ascii=False, indent=2) + "\n",
@@ -1229,6 +1683,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.marker_retry_delay < 0:
         print(
             "エラー: --marker-retry-delay は0以上にしてください。",
+            file=sys.stderr,
+        )
+        return 2
+    if args.speech_retries < 0:
+        print("エラー: --speech-retries は0以上にしてください。", file=sys.stderr)
+        return 2
+    if args.speech_retry_delay < 0:
+        print(
+            "エラー: --speech-retry-delay は0以上にしてください。",
             file=sys.stderr,
         )
         return 2
@@ -1340,6 +1803,185 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError("OCR本文が空です。Enterは送りません。")
                 if last_text == text:
                     raise RuntimeError("前の画面と同じ本文です。Enterは送りません。")
+
+                choices = extract_choice_options(text)
+                if choices:
+                    advance_marker = AdvanceMarker(
+                        "choices",
+                        1.0,
+                        None,
+                        waited_seconds=advance_marker.waited_seconds,
+                        retry_count=advance_marker.retry_count,
+                    )
+                    print(f"\n[{turn_number}/{turns}] 選択肢:")
+                    for option in choices:
+                        print(f"{option.label}: {option.text}")
+                    if args.narration_only:
+                        raise RuntimeError(
+                            "選択肢を検出しましたが、--narration-only では"
+                            "意見を発話できないため選択しません。"
+                        )
+
+                    planner.record_game_text(
+                        turn_number=turn_number,
+                        text=collapse_visual_line_breaks(text),
+                    )
+                    print("選択肢への意見と選ぶ項目を決めています...")
+                    choice_plan_response = planner.generate_text(
+                        phase="choice_plan",
+                        instructions=build_choice_prompt(choices),
+                        use_conversation_history=True,
+                    )
+                    if not choice_plan_response.text:
+                        print("警告: 選択計画が空だったため、1回だけ再生成します。")
+                        choice_plan_response = planner.generate_text(
+                            phase="choice_plan_retry",
+                            instructions=build_choice_prompt(choices),
+                            use_conversation_history=True,
+                        )
+                    if not choice_plan_response.text:
+                        raise RuntimeError(
+                            "選択計画を生成できませんでした。キー入力は行いません。"
+                        )
+
+                    choice_plan = parse_choice_plan(choice_plan_response.text)
+                    choice_issue = choice_plan_issue(choice_plan, choices)
+                    for revision_number in range(
+                        1,
+                        CHOICE_PLAN_REVISIONS + 1,
+                    ):
+                        if choice_issue is None:
+                            break
+                        print(
+                            "選択案を再生成します: "
+                            f"{choice_issue}（{revision_number}/"
+                            f"{CHOICE_PLAN_REVISIONS}）"
+                        )
+                        choice_plan_response = planner.generate_text(
+                            phase=f"choice_plan_revision_{revision_number}",
+                            instructions=build_choice_revision_prompt(
+                                choices,
+                                choice_plan,
+                                choice_issue,
+                            ),
+                            use_conversation_history=True,
+                        )
+                        if not choice_plan_response.text:
+                            raise RuntimeError(
+                                "選択案の再生成結果が空でした。"
+                                "キー入力は行いません。"
+                            )
+                        choice_plan = parse_choice_plan(
+                            choice_plan_response.text
+                        )
+                        choice_issue = choice_plan_issue(choice_plan, choices)
+                    if choice_issue is not None:
+                        raise RuntimeError(
+                            "選択案が条件を満たせませんでした: "
+                            f"{choice_issue}。キー入力は行いません。"
+                        )
+
+                    selected_index = next(
+                        index
+                        for index, option in enumerate(choices)
+                        if option.label == choice_plan.selected_label
+                    )
+                    selected_option = choices[selected_index]
+                    utterance = choice_utterance(choice_plan)
+                    choice_record = {
+                        **asdict(choice_plan),
+                        "utterance": utterance,
+                        "selected_index": selected_index,
+                        "selected_option": asdict(selected_option),
+                        "options": [asdict(option) for option in choices],
+                        "raw_response": choice_plan_response.text,
+                        "response_id": choice_plan_response.response_id,
+                    }
+                    (turn_dir / "choice_plan.json").write_text(
+                        json.dumps(
+                            choice_record,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"選択予定: {choice_plan.selected_label} / "
+                        f"意見: {choice_plan.opinion}"
+                    )
+                    print("意見と選択宣言を再生しています...")
+                    (
+                        choice_speech,
+                        choice_verification,
+                        choice_speech_retries,
+                    ) = speak_choice_with_retries(
+                        realtime,
+                        choice_plan,
+                        turn_dir=turn_dir,
+                        playback=not args.no_playback,
+                        retries=args.speech_retries,
+                        retry_delay=args.speech_retry_delay,
+                        allow_mismatch=args.allow_narration_mismatch,
+                    )
+                    print(f"選択発話: {choice_speech.transcript}")
+                    print(
+                        "選択発話確認: "
+                        f"{'OK' if choice_verification.matches else '要確認'} / "
+                        f"完全一致={'yes' if choice_verification.exact else 'no'} / "
+                        f"類似度={choice_verification.similarity:.3f} / "
+                        f"再試行={choice_speech_retries}回"
+                    )
+
+                    summary = {
+                        "model": args.model,
+                        "commentary_model": commentary_model,
+                        "voice": args.voice,
+                        "source_text": text,
+                        "turn_text": collapse_visual_line_breaks(text),
+                        "page_text": "".join(page_text_parts),
+                        "advance_marker": asdict(advance_marker),
+                        "choice_options": [
+                            asdict(option) for option in choices
+                        ],
+                        "choice_plan": choice_record,
+                        "choice_speech": asdict(choice_speech),
+                        "choice_speech_verification": asdict(
+                            choice_verification
+                        ),
+                        "choice_speech_matches": choice_verification.matches,
+                        "choice_speech_retries": choice_speech_retries,
+                        "enter_pressed": False,
+                        "selection_performed": False,
+                        "enter_blocked_reason": None,
+                    }
+                    if args.press_enter:
+                        if window is None:
+                            raise RuntimeError(
+                                "選択キーの送信先ウィンドウがありません。"
+                            )
+                        select_choice(window.hwnd, selected_index)
+                        summary["enter_pressed"] = True
+                        summary["selection_performed"] = True
+                        print(
+                            f"ゲームで{choice_plan.selected_label}を選択しました"
+                            f"（↓ {selected_index}回 → Enter）。"
+                        )
+                    (turn_dir / "result.json").write_text(
+                        json.dumps(
+                            summary,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    last_text = text
+                    page_text_parts.clear()
+                    page_has_spoken = False
+                    if turn_number < turns:
+                        time.sleep(args.after_enter_delay)
+                    continue
 
                 print(f"\n[{turn_number}/{turns}] OCR本文:\n{text}")
                 turn_text = extract_incremental_text(last_text, text)

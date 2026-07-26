@@ -16,7 +16,9 @@ SW_RESTORE = 9
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 VK_RETURN = 0x0D
+VK_DOWN = 0x28
 ENTER_SCAN_CODE = 0x1C
+DOWN_SCAN_CODE = 0x50
 
 
 class POINT(ctypes.Structure):
@@ -199,18 +201,53 @@ def capture_client(
     return ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
 
 
-def press_enter(hwnd: int, *, activate: bool = True) -> None:
-    """Post a scoped Enter key press to the selected window."""
-    if activate:
-        activate_window(hwnd, wait_seconds=0.1)
-    key_down_lparam = 1 | (ENTER_SCAN_CODE << 16)
+def _post_key(
+    hwnd: int,
+    virtual_key: int,
+    scan_code: int,
+    *,
+    extended: bool = False,
+) -> None:
+    key_down_lparam = 1 | (scan_code << 16)
+    if extended:
+        key_down_lparam |= 1 << 24
     key_up_lparam = key_down_lparam | (1 << 30) | (1 << 31)
     _check(
-        user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, key_down_lparam),
+        user32.PostMessageW(hwnd, WM_KEYDOWN, virtual_key, key_down_lparam),
         "PostMessageW(WM_KEYDOWN)",
     )
     time.sleep(0.03)
     _check(
-        user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, key_up_lparam),
+        user32.PostMessageW(hwnd, WM_KEYUP, virtual_key, key_up_lparam),
         "PostMessageW(WM_KEYUP)",
     )
+
+
+def press_enter(hwnd: int, *, activate: bool = True) -> None:
+    """Post a scoped Enter key press to the selected window."""
+    if activate:
+        activate_window(hwnd, wait_seconds=0.1)
+    _post_key(hwnd, VK_RETURN, ENTER_SCAN_CODE)
+
+
+def select_choice(
+    hwnd: int,
+    choice_index: int,
+    *,
+    activate: bool = True,
+    key_interval: float = 0.08,
+) -> None:
+    """Select a zero-based menu item with Down presses followed by Enter."""
+    if choice_index < 0:
+        raise ValueError("choice_index must be zero or greater")
+    if activate:
+        activate_window(hwnd, wait_seconds=0.1)
+    for _ in range(choice_index):
+        _post_key(
+            hwnd,
+            VK_DOWN,
+            DOWN_SCAN_CODE,
+            extended=True,
+        )
+        time.sleep(max(key_interval, 0))
+    _post_key(hwnd, VK_RETURN, ENTER_SCAN_CODE)

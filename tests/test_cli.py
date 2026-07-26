@@ -4,19 +4,31 @@ import pytest
 from PIL import Image, ImageDraw
 
 import game_window_ocr.commentary as commentary_module
+import game_window_ocr.windows as windows_module
 from game_window_ocr.cli import clean_ocr_text, parse_crop, prepare_ocr_image
 from game_window_ocr.commentary import (
+    ChoiceOption,
+    ChoicePlan,
     CommentaryPlan,
+    SpeechResult,
+    TextResult,
     apply_commentary_intensity_boost,
+    build_choice_prompt,
     build_commentary_prompt,
     build_commentary_speech_prompt,
     build_narration_prompt,
+    choice_plan_issue,
+    choice_utterance,
     collapse_visual_line_breaks,
     commentary_plan_issue,
     detect_advance_marker,
+    extract_choice_options,
     extract_incremental_text,
     narration_matches,
+    parse_choice_plan,
     parse_commentary_plan,
+    speak_choice_with_retries,
+    verify_choice_speech,
 )
 from game_window_ocr.windows import normalize_title
 
@@ -25,6 +37,29 @@ def test_title_normalization_matches_ascii_and_full_width() -> None:
     assert normalize_title("かまいたちの夜x3") == normalize_title(
         "かまいたちの夜×３"
     )
+
+
+def test_select_choice_sends_down_for_index_then_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys: list[tuple[int, int, bool]] = []
+    monkeypatch.setattr(windows_module, "activate_window", lambda hwnd, **kwargs: None)
+    monkeypatch.setattr(
+        windows_module,
+        "_post_key",
+        lambda hwnd, virtual_key, scan_code, *, extended=False: keys.append(
+            (virtual_key, scan_code, extended)
+        ),
+    )
+    monkeypatch.setattr(windows_module.time, "sleep", lambda seconds: None)
+
+    windows_module.select_choice(123, 2)
+
+    assert keys == [
+        (windows_module.VK_DOWN, windows_module.DOWN_SCAN_CODE, True),
+        (windows_module.VK_DOWN, windows_module.DOWN_SCAN_CODE, True),
+        (windows_module.VK_RETURN, windows_module.ENTER_SCAN_CODE, False),
+    ]
 
 
 def test_parse_crop() -> None:
@@ -159,6 +194,270 @@ def test_commentary_prompt_limits_length_and_repetition() -> None:
     assert "20代くらいの女性" in prompt
     assert "短めの2～3文・合計28～90文字" in prompt
     assert "頼りになりそうだよね" in prompt
+
+
+def test_extract_choice_options_keeps_multiline_option_text() -> None:
+    text = (
+        "〉〉\n"
+        "-A:「な、何言ってんだよ!」\n"
+        "ぼくはドギマギした。\n"
+        "B:「愚問だよ、ハニー」\n"
+        "ぼくは指を振った。\n"
+        "C:「待ってて、じっくり吟味するから」\n"
+        "ぼくは視線を向けた。"
+    )
+    assert extract_choice_options(text) == (
+        ChoiceOption(
+            label="A",
+            text="「な、何言ってんだよ!」ぼくはドギマギした。",
+        ),
+        ChoiceOption(
+            label="B",
+            text="「愚問だよ、ハニー」ぼくは指を振った。",
+        ),
+        ChoiceOption(
+            label="C",
+            text="「待ってて、じっくり吟味するから」ぼくは視線を向けた。",
+        ),
+    )
+
+
+def test_extract_choice_options_accepts_full_width_labels() -> None:
+    assert extract_choice_options("Ａ：「一つ目」\nＢ：「二つ目」") == (
+        ChoiceOption("A", "「一つ目」"),
+        ChoiceOption("B", "「二つ目」"),
+    )
+
+
+def test_extract_choice_options_rejects_non_contiguous_labels() -> None:
+    assert extract_choice_options("A: 一つ目\nC: 三つ目") == ()
+
+
+def test_choice_plan_and_utterance_require_opinion_before_declaration() -> None:
+    options = (
+        ChoiceOption("A", "正直に答える"),
+        ChoiceOption("B", "強がって答える"),
+        ChoiceOption("C", "考え込む"),
+    )
+    plan = parse_choice_plan(
+        '{"selected_label":"Ｂ","opinion":"強がった後の反応が面白そうだよね。",'
+        '"emotion":"amused","intensity":0.7,"pace":"normal"}'
+    )
+    assert plan == ChoicePlan(
+        selected_label="B",
+        opinion="強がった後の反応が面白そうだよね。",
+        emotion="amused",
+        intensity=0.7,
+        pace="normal",
+    )
+    assert choice_plan_issue(plan, options) is None
+    assert choice_utterance(plan) == (
+        "強がった後の反応が面白そうだよね。 ここはBを選ぶね。"
+    )
+
+
+def test_choice_plan_rejects_unknown_label_and_embedded_declaration() -> None:
+    options = (
+        ChoiceOption("A", "一つ目"),
+        ChoiceOption("B", "二つ目"),
+    )
+    unknown = ChoicePlan("C", "こっちの続きが気になるよね。", "calm", 0.6, "normal")
+    declared = ChoicePlan("B", "面白そうだからBにするね。", "amused", 0.7, "normal")
+    assert "表示中の選択肢" in (choice_plan_issue(unknown, options) or "")
+    assert "選択宣言" in (choice_plan_issue(declared, options) or "")
+
+
+def test_choice_speech_accepts_orthographic_variation_from_transcript() -> None:
+    plan = ChoicePlan(
+        "B",
+        "このキザなノリ、逆に笑えていい味出てる。",
+        "amused",
+        0.7,
+        "normal",
+    )
+    verification = verify_choice_speech(
+        plan,
+        "このキザなノリ、逆に笑えて良い味出てる。ここはBを選ぶね。",
+    )
+    assert verification.matches is True
+    assert verification.exact is False
+    assert verification.similarity == pytest.approx(1.0)
+    assert verification.selection_declared is True
+
+
+def test_choice_speech_rejects_wrong_selection_or_missing_opinion() -> None:
+    plan = ChoicePlan(
+        "B",
+        "この返事の後が気になるよね。",
+        "thoughtful",
+        0.6,
+        "normal",
+    )
+    wrong = verify_choice_speech(
+        plan,
+        "この返事の後が気になるよね。ここはCを選ぶね。",
+    )
+    no_opinion = verify_choice_speech(plan, "ここはBを選ぶね。")
+    assert wrong.matches is False
+    assert "選択先B" in (wrong.reason or "")
+    assert no_opinion.matches is False
+    assert "意見" in (no_opinion.reason or "")
+
+
+def test_choice_speech_retries_until_selection_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    plan = ChoicePlan(
+        "B",
+        "この返事の後が気になるよね。",
+        "thoughtful",
+        0.6,
+        "normal",
+    )
+    transcripts = iter(
+        [
+            "この返事の後が気になるよね。ここはCを選ぶね。",
+            "この返事の後が気になるよね。ここはBを選ぶね。",
+        ]
+    )
+
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            return SpeechResult(
+                phase=str(kwargs["phase"]),
+                transcript=next(transcripts),
+                audio_bytes=10,
+                response_id=None,
+            )
+
+    monkeypatch.setattr(commentary_module.time, "sleep", lambda seconds: None)
+    speech, verification, retries = speak_choice_with_retries(
+        FakeRealtime(),
+        plan,
+        turn_dir=tmp_path,
+        playback=False,
+        retries=2,
+        retry_delay=0.5,
+    )
+    assert speech.transcript.endswith("Bを選ぶね。")
+    assert verification.matches is True
+    assert retries == 1
+    assert (tmp_path / "choice_transcript.txt").exists()
+    assert (tmp_path / "choice_retry_001_transcript.txt").exists()
+
+
+def test_choice_prompt_contains_only_available_labels() -> None:
+    prompt = build_choice_prompt(
+        (
+            ChoiceOption("A", "一つ目"),
+            ChoiceOption("B", "二つ目"),
+        )
+    )
+    assert "A, B" in prompt
+    assert '"label": "A"' in prompt
+    assert '"label": "B"' in prompt
+    assert "選択宣言はプログラムが" in prompt
+
+
+def test_main_speaks_choice_before_sending_selection_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+    choice_text = "A: 正直に答える\nB: 強がって答える\nC: じっくり考える"
+    expected_utterance = (
+        "意外な返事のほうが面白い展開になりそうだよね。 "
+        "ここはCを選ぶね。"
+    )
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def record_game_text(self, *, turn_number: int, text: str) -> None:
+            events.append("record")
+
+        def generate_text(self, **kwargs) -> TextResult:
+            events.append("plan")
+            return TextResult(
+                text=(
+                    '{"selected_label":"C",'
+                    '"opinion":"意外な返事のほうが面白い展開になりそうだよね。",'
+                    '"emotion":"amused","intensity":0.7,"pace":"normal"}'
+                ),
+                response_id="choice-plan",
+            )
+
+        def speak(self, **kwargs) -> SpeechResult:
+            events.append("speak")
+            return SpeechResult(
+                phase="choice",
+                transcript=expected_utterance,
+                audio_bytes=100,
+                response_id="choice-speech",
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "select_choice",
+        lambda hwnd, index: events.append(f"select:{index}"),
+    )
+
+    result = commentary_module.main(
+        [
+            "--text",
+            choice_text,
+            "--press-enter",
+            "--no-playback",
+            "--no-obs-window",
+            "--model",
+            "same-model",
+            "--commentary-model",
+            "same-model",
+            "--output",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    assert events == ["record", "plan", "speak", "select:2"]
+    summary = json.loads(
+        (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert summary["choice_plan"]["selected_label"] == "C"
+    assert summary["selection_performed"] is True
 
 
 @pytest.mark.parametrize(
@@ -602,6 +901,13 @@ def test_narration_match_ignores_spaces_and_punctuation() -> None:
         "ぼくの名前は透 東京の大学に通う学生だ",
     )
     assert not narration_matches("透です。", "真理です。")
+
+
+def test_narration_match_accepts_good_orthographic_variation() -> None:
+    assert narration_matches(
+        "このノリ、いい味出てる。",
+        "このノリ、良い味出てる。",
+    )
 
 
 def test_clean_ocr_text_strips_page_cursor_attached_to_last_line(tmp_path) -> None:
