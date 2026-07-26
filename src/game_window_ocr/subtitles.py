@@ -6,7 +6,11 @@ from pathlib import Path
 
 
 _SENTENCE_END = re.compile(
-    r"([。！？!?]+)([」』】）》〉〕〗〙〛]*)(?:[ \t]*)(?=\S)"
+    r"([。！？!?]+)([」』】）》〉〕〗〙〛]*)(?:[ \t]*)"
+    r"(?![。！？!?])(?=\S)"
+)
+_WHITESPACE_BETWEEN_EXCLAMATION_AND_QUESTION = re.compile(
+    r"(?<=[！!])[ \t\n]+(?=[？?])|(?<=[？?])[ \t\n]+(?=[！!])"
 )
 
 
@@ -17,6 +21,9 @@ def _break_lines_after_sentence_end(text: str) -> str:
 def _normalize_subtitle_text(text: str) -> str:
     normalized_text = (
         text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    )
+    normalized_text = _WHITESPACE_BETWEEN_EXCLAMATION_AND_QUESTION.sub(
+        "", normalized_text
     )
     return _break_lines_after_sentence_end(normalized_text)
 

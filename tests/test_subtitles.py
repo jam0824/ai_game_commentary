@@ -71,6 +71,28 @@ def test_srt_writer_breaks_lines_after_sentence_end_marks(tmp_path) -> None:
     )
 
 
+def test_srt_writer_does_not_break_between_exclamation_and_question(
+    tmp_path,
+) -> None:
+    path = tmp_path / "commentary.srt"
+    writer = SrtSubtitleWriter(path)
+
+    writer.add_cue(
+        "えっ! ?本当なの？\n！次も驚いた！?",
+        start_seconds=0.0,
+        end_seconds=1.0,
+    )
+
+    assert path.read_text(encoding="utf-8-sig") == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "えっ!?\n"
+        "本当なの？！\n"
+        "次も驚いた！?\n"
+        "\n"
+    )
+
+
 def test_srt_writer_groups_lines_and_distributes_time_by_text_length(
     tmp_path,
 ) -> None:
