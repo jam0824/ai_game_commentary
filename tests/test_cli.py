@@ -196,6 +196,50 @@ def test_ocr_replacements_are_loaded_and_applied_in_file_order(
     ) == "まりはトオルに尋ねた。"
 
 
+def test_luna_speech_plan_text_uses_the_same_replacements() -> None:
+    replacements = [("真理", "マリ"), ("透", "トオル")]
+
+    commentary_plan = commentary_module.apply_commentary_plan_replacements(
+        CommentaryPlan(
+            comment="真理と透が気になるね。",
+            mode="quick",
+            emotion="thoughtful",
+            intensity=0.6,
+            pace="normal",
+        ),
+        replacements,
+    )
+    choice_plan = commentary_module.apply_choice_plan_replacements(
+        ChoicePlan(
+            selected_label="B",
+            opinion="透を信じてみたい。",
+            emotion="thoughtful",
+            intensity=0.6,
+            pace="normal",
+        ),
+        replacements,
+    )
+    closing_plan = commentary_module.apply_closing_plan_replacements(
+        commentary_module.ClosingPlan(
+            ending_line="真理と透の話はここまで。",
+            session_impression="透の行動が気になったね。",
+            call_to_action="次回も真理を見守ってね。",
+            emotion="thoughtful",
+            intensity=0.6,
+            pace="normal",
+        ),
+        replacements,
+    )
+
+    assert commentary_plan.comment == "マリとトオルが気になるね。"
+    assert choice_plan.opinion == "トオルを信じてみたい。"
+    assert closing_plan.message == (
+        "マリとトオルの話はここまで。"
+        "トオルの行動が気になったね。"
+        "次回もマリを見守ってね。"
+    )
+
+
 def test_invalid_ocr_replacement_lines_do_not_block_valid_replacements(
     tmp_path,
     capsys: pytest.CaptureFixture[str],
@@ -2488,6 +2532,7 @@ def test_resume_startup_summarizes_memory_and_saves_speech_artifacts(
         root=root,
         persona="人間を知りたいAI。",
         playback=False,
+        replacements=[("透", "トオル")],
     )
 
     record = json.loads(
@@ -2503,7 +2548,10 @@ def test_resume_startup_summarizes_memory_and_saves_speech_artifacts(
     assert "スカイナ" in record["message"]
     assert "前回の続き" in record["message"]
     assert "雪山の宿へ到着" in record["message"]
+    assert "トオル" in record["message"]
+    assert "透" in record["raw_response"]
     assert speech_calls[0]["phase"] == "startup"
+    assert "トオル" in speech_calls[0]["instructions"]
     assert (root / "startup_transcript.txt").read_text(
         encoding="utf-8"
     ) == "再開挨拶の転写\n"

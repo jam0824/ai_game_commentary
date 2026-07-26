@@ -14,12 +14,12 @@ import unicodedata
 import wave
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.parse import urlencode
 
 import cv2
@@ -185,9 +185,9 @@ def load_ocr_replacements(path: Path) -> list[tuple[str, str]]:
 
 def apply_ocr_replacements(
     text: str,
-    replacements: list[tuple[str, str]] | tuple[tuple[str, str], ...],
+    replacements: Sequence[tuple[str, str]],
 ) -> str:
-    """Apply OCR replacements mechanically in file order."""
+    """Apply configured text replacements mechanically in file order."""
     replaced = text
     for source, replacement in replacements:
         replaced = replaced.replace(source, replacement)
@@ -506,6 +506,44 @@ class ClosingPlan:
                 self.call_to_action.strip(),
             )
         )
+
+
+def apply_commentary_plan_replacements(
+    plan: CommentaryPlan,
+    replacements: Sequence[tuple[str, str]],
+) -> CommentaryPlan:
+    return replace(
+        plan,
+        comment=apply_ocr_replacements(plan.comment, replacements),
+    )
+
+
+def apply_choice_plan_replacements(
+    plan: ChoicePlan,
+    replacements: Sequence[tuple[str, str]],
+) -> ChoicePlan:
+    return replace(
+        plan,
+        opinion=apply_ocr_replacements(plan.opinion, replacements),
+    )
+
+
+def apply_closing_plan_replacements(
+    plan: ClosingPlan,
+    replacements: Sequence[tuple[str, str]],
+) -> ClosingPlan:
+    return replace(
+        plan,
+        ending_line=apply_ocr_replacements(plan.ending_line, replacements),
+        session_impression=apply_ocr_replacements(
+            plan.session_impression,
+            replacements,
+        ),
+        call_to_action=apply_ocr_replacements(
+            plan.call_to_action,
+            replacements,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -3024,7 +3062,9 @@ def _deliver_startup_message(
     playback: bool,
     generation_errors: list[str],
     response: TextResult | None,
+    replacements: Sequence[tuple[str, str]] = (),
 ) -> None:
+    message = apply_ocr_replacements(message, replacements)
     startup_record = {
         "schema_version": 1,
         "commentator_name": COMMENTATOR_NAME,
@@ -3107,6 +3147,7 @@ def _create_startup_message(
     root: Path,
     persona: str,
     playback: bool,
+    replacements: Sequence[tuple[str, str]] = (),
 ) -> None:
     response: TextResult | None = None
     errors: list[str] = []
@@ -3151,6 +3192,7 @@ def _create_startup_message(
         playback=playback,
         generation_errors=errors,
         response=response,
+        replacements=replacements,
     )
 
 
@@ -3164,7 +3206,9 @@ def _deliver_closing_message(
     playback: bool,
     generation_errors: list[str],
     response: TextResult | None,
+    replacements: Sequence[tuple[str, str]] = (),
 ) -> None:
+    plan = apply_closing_plan_replacements(plan, replacements)
     closing_record = {
         **asdict(plan),
         "message": plan.message,
@@ -3233,6 +3277,7 @@ def _create_closing_message(
     records: list[dict[str, Any]],
     persona: str,
     playback: bool,
+    replacements: Sequence[tuple[str, str]] = (),
 ) -> None:
     payload, response, errors = _generate_structured_with_retries(
         planner,
@@ -3266,6 +3311,7 @@ def _create_closing_message(
         playback=playback,
         generation_errors=errors,
         response=response,
+        replacements=replacements,
     )
 
 
@@ -3482,6 +3528,7 @@ def _finalize_timed_session(
             records=records,
             persona=persona,
             playback=not args.no_playback,
+            replacements=args.ocr_replacements,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(
@@ -3736,6 +3783,7 @@ def main(argv: list[str] | None = None) -> int:
                         root=root,
                         persona=commentator_persona,
                         playback=not args.no_playback,
+                        replacements=args.ocr_replacements,
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     print(
@@ -4180,6 +4228,13 @@ def main(argv: list[str] | None = None) -> int:
                         termination_reason = choice_stop_reason
                         break
 
+                    # Apply pronunciation rules after validation so a purely
+                    # phonetic replacement cannot trigger regeneration or stop
+                    # the game from progressing.
+                    choice_plan = apply_choice_plan_replacements(
+                        choice_plan,
+                        args.ocr_replacements,
+                    )
                     selected_index = next(
                         index
                         for index, option in enumerate(choices)
@@ -4514,6 +4569,12 @@ def main(argv: list[str] | None = None) -> int:
                     commentary_plan, commentary_intensity_boosted = (
                         apply_commentary_intensity_boost(commentary_plan)
                     )
+                    # Keep pronunciation rules outside plan validation so they
+                    # cannot turn a valid Luna response into a stopping error.
+                    commentary_plan = apply_commentary_plan_replacements(
+                        commentary_plan,
+                        args.ocr_replacements,
+                    )
                     if commentary_intensity_boosted:
                         print("配信向けに感情表現の強度を引き上げました。")
                     plan_record = {
@@ -4676,6 +4737,7 @@ def main(argv: list[str] | None = None) -> int:
                         playback=not args.no_playback,
                         generation_errors=[str(exc)],
                         response=None,
+                        replacements=args.ocr_replacements,
                     )
                     try:
                         _write_json_atomic(
