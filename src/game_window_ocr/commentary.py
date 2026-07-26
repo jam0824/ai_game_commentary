@@ -237,7 +237,9 @@ def _persona_prompt_section(
     persona = persona.strip()
     phase_rule = (
         "これは実況セッション開始時の最初の挨拶です。"
-        f"開始句として「{STARTUP_GREETING}」を使用できます。\n\n"
+        "完成済みのresponse_textには開始句と自己紹介がすでに含まれています。"
+        f"「{STARTUP_GREETING}」を含む挨拶、返事、前置きを別途追加せず、"
+        "response_textの先頭から話してください。\n\n"
         if startup
         else (
             "これは実況セッション開始時の挨拶ではありません。人格設定に開始挨拶の"
@@ -484,6 +486,7 @@ class SpeechResult:
     response_id: str | None
     started_at_seconds: float | None = None
     ended_at_seconds: float | None = None
+    playback_suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -931,6 +934,15 @@ def _normalize_ocr_stability_text(text: str) -> str:
     return "".join(char for char in normalized if not char.isspace())
 
 
+def _same_ocr_text(first: str | None, second: str) -> bool:
+    if not first or not second:
+        return False
+    return (
+        _normalize_ocr_stability_text(first)
+        == _normalize_ocr_stability_text(second)
+    )
+
+
 def build_choice_prompt(
     options: tuple[ChoiceOption, ...],
     *,
@@ -1233,6 +1245,19 @@ def _build_resume_message(recap: str) -> str:
         f"前回までの流れは、{recap}"
         "それでは、再開します。"
     )
+
+
+def _startup_playback_prefix(message: str) -> str:
+    """Guard the fixed greeting and self-introduction before playing audio."""
+    normalized = collapse_visual_line_breaks(message)
+    sentence_ends = [
+        index
+        for index, char in enumerate(normalized)
+        if char in "。！？!?"
+    ]
+    if len(sentence_ends) >= 2:
+        return normalized[: sentence_ends[1] + 1]
+    return normalized
 
 
 def build_session_memory_prompt(
@@ -1691,7 +1716,8 @@ def build_commentary_speech_prompt(
         "末尾で終了する。「了解です」「朗読しますね」「読み上げます」などを"
         "前後へ追加しない。\n"
         + (
-            "- 今回は開始挨拶なので、response_textに含まれる開始句をそのまま話す。\n"
+            "- 今回は開始挨拶なので、response_textに含まれる開始句を1回だけ"
+            "そのまま話す。開始句や「それでは」などの前置きを別途追加しない。\n"
             if startup
             else (
                 f"- 今回は開始挨拶ではない。「{STARTUP_GREETING.rstrip('。')}」や"
@@ -1813,6 +1839,18 @@ def narration_matches(source: str, transcript: str) -> bool:
     return bool(normalized_source) and normalized_source == normalized_transcript
 
 
+def _spoken_prefix_status(expected_prefix: str, transcript: str) -> str:
+    expected = normalize_spoken_text(expected_prefix)
+    actual = normalize_spoken_text(transcript)
+    if not expected or not actual:
+        return "pending"
+    if actual.startswith(expected):
+        return "matched"
+    if expected.startswith(actual):
+        return "pending"
+    return "mismatched"
+
+
 def _normalize_choice_verification_text(text: str) -> str:
     normalized = normalize_spoken_variants(text)
     for label, reading in _SPOKEN_CHOICE_LABELS.items():
@@ -1883,11 +1921,19 @@ def verify_choice_speech(
 
 
 class AudioSink:
-    def __init__(self, path: Path, *, playback: bool) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        playback: bool,
+        defer_playback: bool = False,
+    ) -> None:
         self.path = path
         self.playback = playback
+        self.defer_playback = defer_playback
         self._wave: wave.Wave_write | None = None
         self._stream: Any = None
+        self._playback_failed = False
 
     def __enter__(self) -> AudioSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1897,29 +1943,43 @@ class AudioSink:
         output.setframerate(SAMPLE_RATE)
         self._wave = output
 
-        if self.playback:
-            try:
-                import sounddevice as sd
-
-                self._stream = sd.RawOutputStream(
-                    samplerate=SAMPLE_RATE,
-                    channels=1,
-                    dtype="int16",
-                )
-                self._stream.start()
-            except Exception as exc:
-                self._stream = None
-                print(
-                    f"警告: 音声デバイスを開始できないため、WAV保存のみ続行します: {exc}",
-                    file=sys.stderr,
-                )
+        if self.playback and not self.defer_playback:
+            self.start_playback()
         return self
+
+    def start_playback(self) -> bool:
+        if not self.playback or self._playback_failed:
+            return False
+        if self._stream is not None:
+            return True
+        try:
+            import sounddevice as sd
+
+            self._stream = sd.RawOutputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+            )
+            self._stream.start()
+        except Exception as exc:
+            self._stream = None
+            self._playback_failed = True
+            print(
+                f"警告: 音声デバイスを開始できないため、WAV保存のみ続行します: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        return True
 
     def write(self, chunk: bytes) -> None:
         if self._wave is None:
             raise RuntimeError("音声出力が開始されていません。")
         self._wave.writeframesraw(chunk)
         if self._stream is not None:
+            self._stream.write(chunk)
+
+    def play_buffered(self, chunk: bytes) -> None:
+        if self._stream is not None and chunk:
             self._stream.write(chunk)
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -2196,6 +2256,7 @@ class RealtimeSpeechClient:
         instructions: str,
         wav_path: Path,
         playback: bool,
+        playback_prefix: str | None = None,
     ) -> SpeechResult:
         response: dict[str, Any] = {
             "metadata": {"phase": phase},
@@ -2210,7 +2271,14 @@ class RealtimeSpeechClient:
         audio_bytes = 0
         started_at_seconds: float | None = None
         response_id: str | None = None
-        with AudioSink(wav_path, playback=playback) as sink:
+        guarded_playback = bool(playback and playback_prefix)
+        prefix_status = "pending" if guarded_playback else "matched"
+        buffered_audio = bytearray()
+        with AudioSink(
+            wav_path,
+            playback=playback,
+            defer_playback=guarded_playback,
+        ) as sink:
             while True:
                 event = self._receive()
                 event_type = event.get("type")
@@ -2220,15 +2288,34 @@ class RealtimeSpeechClient:
                         chunk
                         and started_at_seconds is None
                         and self.timeline_origin is not None
+                        and not guarded_playback
                     ):
                         started_at_seconds = max(
                             0.0,
                             time.monotonic() - self.timeline_origin,
                         )
                     audio_bytes += len(chunk)
+                    if guarded_playback and prefix_status == "pending":
+                        buffered_audio.extend(chunk)
                     sink.write(chunk)
                 elif event_type == "response.output_audio_transcript.delta":
                     transcript_parts.append(str(event.get("delta", "")))
+                    if guarded_playback and prefix_status == "pending":
+                        prefix_status = _spoken_prefix_status(
+                            playback_prefix or "",
+                            "".join(transcript_parts),
+                        )
+                        if prefix_status == "matched":
+                            if sink.start_playback():
+                                if self.timeline_origin is not None:
+                                    started_at_seconds = max(
+                                        0.0,
+                                        time.monotonic() - self.timeline_origin,
+                                    )
+                                sink.play_buffered(bytes(buffered_audio))
+                            buffered_audio.clear()
+                        elif prefix_status == "mismatched":
+                            buffered_audio.clear()
                 elif event_type == "response.done":
                     response = event.get("response", {})
                     response_id = response.get("id")
@@ -2239,6 +2326,21 @@ class RealtimeSpeechClient:
                             f"Realtime応答が完了しませんでした: {status} / {details}"
                         )
                     break
+
+            if guarded_playback and prefix_status == "pending":
+                prefix_status = _spoken_prefix_status(
+                    playback_prefix or "",
+                    "".join(transcript_parts),
+                )
+                if prefix_status == "matched":
+                    if sink.start_playback():
+                        if self.timeline_origin is not None:
+                            started_at_seconds = max(
+                                0.0,
+                                time.monotonic() - self.timeline_origin,
+                            )
+                        sink.play_buffered(bytes(buffered_audio))
+                buffered_audio.clear()
 
         ended_at_seconds = (
             started_at_seconds + audio_bytes / PCM_BYTES_PER_SECOND
@@ -2252,6 +2354,9 @@ class RealtimeSpeechClient:
             response_id=response_id,
             started_at_seconds=started_at_seconds,
             ended_at_seconds=ended_at_seconds,
+            playback_suppressed=(
+                guarded_playback and prefix_status != "matched"
+            ),
         )
 
 
@@ -2781,10 +2886,13 @@ def _capture_and_ocr(
                 stable_ocr_key = current_ocr_key
                 stable_ocr_samples = 1 if current_ocr_key else 0
 
-            if (
+            stable_non_choice_text = (
                 stable_ocr_samples >= args.stable_ocr_samples
-                and extract_incremental_text(previous_text, text)
                 and not _contains_choice_label(text)
+            )
+            if stable_non_choice_text and (
+                extract_incremental_text(previous_text, text)
+                or _same_ocr_text(previous_text, text)
             ):
                 fallback_kind = "stable_text"
                 if (
@@ -2800,13 +2908,24 @@ def _capture_and_ocr(
                     waited_seconds=time.monotonic() - total_started,
                     retry_count=retry_count,
                     candidate_kind=best_marker.candidate_kind,
-                    fallback_reason="stable_ocr",
+                    fallback_reason=(
+                        "unchanged_ocr"
+                        if _same_ocr_text(previous_text, text)
+                        else "stable_ocr"
+                    ),
                 )
-                print(
-                    "文字送りマークは確定できませんでしたが、"
-                    f"OCR本文が{stable_ocr_samples}回連続で変化しないため、"
-                    f"{fallback_kind}として進行します。"
-                )
+                if marker.fallback_reason == "unchanged_ocr":
+                    print(
+                        "文字送りマークは確定できませんでしたが、"
+                        f"直前と同じOCR本文が{stable_ocr_samples}回連続したため、"
+                        "待機を打ち切ってEnter再送判定へ進みます。"
+                    )
+                else:
+                    print(
+                        "文字送りマークは確定できませんでしたが、"
+                        f"OCR本文が{stable_ocr_samples}回連続で変化しないため、"
+                        f"{fallback_kind}として進行します。"
+                    )
                 break
 
         if marker.kind != "none":
@@ -3163,16 +3282,66 @@ def _deliver_startup_message(
         pace="normal",
     )
     try:
-        speech = realtime.speak(
-            phase="startup",
-            instructions=build_commentary_speech_prompt(
-                plan,
-                persona=persona,
-                startup=True,
-            ),
-            wav_path=root / "startup.wav",
-            playback=playback,
+        speech: SpeechResult | None = None
+        speech_prompt = build_commentary_speech_prompt(
+            plan,
+            persona=persona,
+            startup=True,
         )
+        speech_attempts = 2 if playback else 1
+        for attempt in range(1, speech_attempts + 1):
+            instructions = speech_prompt
+            if attempt > 1:
+                instructions += (
+                    "\n\n# Mandatory retry correction\n"
+                    "前回は完成稿にない前置きが生成されたため不採用です。"
+                    "今回はresponse_textの先頭文字から始め、完成稿以外を"
+                    "一切発話しないでください。"
+                )
+            speech = realtime.speak(
+                phase="startup" if attempt == 1 else "startup_retry",
+                instructions=instructions,
+                wav_path=root / "startup.wav",
+                playback=playback,
+                playback_prefix=(
+                    _startup_playback_prefix(message)
+                    if playback
+                    else None
+                ),
+            )
+            if not speech.playback_suppressed:
+                break
+
+            try:
+                (
+                    root / f"startup_rejected_{attempt:03d}_transcript.txt"
+                ).write_text(
+                    speech.transcript + "\n",
+                    encoding="utf-8",
+                )
+                wav_path = root / "startup.wav"
+                if wav_path.exists():
+                    wav_path.replace(
+                        root / f"startup_rejected_{attempt:03d}.wav"
+                    )
+            except OSError as exc:
+                print(
+                    "警告: 不採用にした開始音声の記録に失敗しましたが、"
+                    f"再開処理は続けます: {exc}",
+                    file=sys.stderr,
+                )
+            print(
+                "警告: 開始音声が完成稿と異なる前置きで始まったため、"
+                + (
+                    "再生せずに1回だけ再生成します。"
+                    if attempt < speech_attempts
+                    else "再生せずに実況を続けます。"
+                ),
+                file=sys.stderr,
+            )
+
+        if speech is None:
+            raise RuntimeError("開始音声の生成結果がありません。")
         try:
             (root / "startup_transcript.txt").write_text(
                 speech.transcript + "\n",
@@ -3184,14 +3353,17 @@ def _deliver_startup_message(
                 f"{exc}",
                 file=sys.stderr,
             )
-        try:
-            _append_speech_subtitle(subtitle_writer, message, speech)
-        except (OSError, ValueError) as exc:
-            print(
-                f"警告: 開始挨拶の字幕を保存できませんでした: {exc}",
-                file=sys.stderr,
-            )
-        print(f"開始挨拶: {speech.transcript}")
+        if not speech.playback_suppressed:
+            try:
+                _append_speech_subtitle(subtitle_writer, message, speech)
+            except (OSError, ValueError) as exc:
+                print(
+                    f"警告: 開始挨拶の字幕を保存できませんでした: {exc}",
+                    file=sys.stderr,
+                )
+            print(f"開始挨拶: {speech.transcript}")
+        else:
+            print(f"開始挨拶（再生見送り）: {speech.transcript}")
     except (OSError, RuntimeError, websocket.WebSocketException) as exc:
         try:
             (root / "startup_error.txt").write_text(
@@ -3964,7 +4136,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise RuntimeError(
                             "OCR本文が空です。Enterは送りません。"
                         )
-                    if last_text != text:
+                    if not _same_ocr_text(last_text, text):
                         break
                     duplicate_stop_reason = (
                         _session_stop_reason(

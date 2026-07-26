@@ -1276,7 +1276,7 @@ def test_capture_and_ocr_requires_consecutive_stable_text(
     assert marker.fallback_reason == "stable_ocr"
 
 
-def test_capture_and_ocr_does_not_fallback_without_new_text(
+def test_capture_and_ocr_returns_unchanged_text_for_enter_recovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -1310,15 +1310,6 @@ def test_capture_and_ocr_does_not_fallback_without_new_text(
                     candidate_kind="book",
                 ),
             ),
-            (
-                image,
-                commentary_module.AdvanceMarker(
-                    "triangle",
-                    0.90,
-                    (150, 216),
-                    candidate_kind="triangle",
-                ),
-            ),
         ]
     )
     recognized: list[str] = []
@@ -1350,9 +1341,9 @@ def test_capture_and_ocr_does_not_fallback_without_new_text(
     )
 
     assert text == previous_text
-    assert len(recognized) == 4
-    assert marker.kind == "triangle"
-    assert marker.fallback_reason is None
+    assert len(recognized) == commentary_module.STABLE_OCR_REQUIRED_SAMPLES
+    assert marker.kind == "book"
+    assert marker.fallback_reason == "unchanged_ocr"
 
 
 def test_capture_and_ocr_does_not_fallback_on_partial_choice(
@@ -1560,11 +1551,38 @@ def test_main_resends_enter_without_repeating_speech_for_unchanged_screen(
         [
             "最初の本文。",
             "最初の本文。",
+            "最初の本文。",
+            "最初の本文。",
             "次の本文。",
         ]
     )
     narration_transcripts = iter(["最初の本文。", "次の本文。"])
     image = Image.new("RGB", (960, 540), "black")
+    marker_results = iter(
+        [
+            commentary_module.AdvanceMarker(
+                "book",
+                0.90,
+                (377, 258),
+                candidate_kind="book",
+            ),
+            *[
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.712,
+                    (645, 213),
+                    candidate_kind="book",
+                )
+                for _ in range(commentary_module.STABLE_OCR_REQUIRED_SAMPLES)
+            ],
+            commentary_module.AdvanceMarker(
+                "book",
+                0.90,
+                (377, 258),
+                candidate_kind="book",
+            ),
+        ]
+    )
 
     class FakeObsWindow:
         error = None
@@ -1625,12 +1643,7 @@ def test_main_resends_enter_without_repeating_speech_for_unchanged_screen(
         "wait_for_advance_marker",
         lambda *args, **kwargs: (
             image,
-            commentary_module.AdvanceMarker(
-                "book",
-                0.90,
-                (377, 258),
-                candidate_kind="book",
-            ),
+            next(marker_results),
         ),
     )
     monkeypatch.setattr(
@@ -1678,6 +1691,7 @@ def test_main_resends_enter_without_repeating_speech_for_unchanged_screen(
         ).read_text(encoding="utf-8")
     )
     assert recovery["enter_pressed"] is True
+    assert recovery["advance_marker"]["fallback_reason"] == "unchanged_ocr"
     second_summary = json.loads(
         (tmp_path / "turn_002" / "result.json").read_text(encoding="utf-8")
     )
@@ -2315,6 +2329,8 @@ def test_commentary_speech_prompt_allows_greeting_only_for_startup() -> None:
     assert '"response_text": "スカイナです。"' in commentary_prompt
     assert "これは実況セッション開始時の最初の挨拶です" in startup_prompt
     assert "今回は開始挨拶なので" in startup_prompt
+    assert "開始句を1回だけ" in startup_prompt
+    assert "前置きを別途追加しない" in startup_prompt
     assert "今回は開始挨拶ではない" not in startup_prompt
 
 
@@ -2647,6 +2663,105 @@ def test_resume_startup_summarizes_memory_and_saves_speech_artifacts(
     ) == "再開挨拶の転写\n"
     subtitle_message = record["message"].replace("。", "。\n").rstrip()
     assert subtitle_message in subtitles
+
+
+def test_startup_rejects_preface_and_retries_before_playback(tmp_path) -> None:
+    message = (
+        "ごきげんよう。人間を学ぶ実況AI、スカイナです。"
+        "今回も前回の続きからやっていきましょう。"
+    )
+    invalid_transcript = (
+        "ごきげんよう。それでは、続きを始めますね。" + message
+    )
+    calls: list[dict] = []
+
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SpeechResult(
+                    phase="startup",
+                    transcript=invalid_transcript,
+                    audio_bytes=100,
+                    response_id="rejected",
+                    playback_suppressed=True,
+                )
+            return SpeechResult(
+                phase="startup_retry",
+                transcript=message,
+                audio_bytes=100,
+                response_id="accepted",
+                started_at_seconds=1.0,
+                ended_at_seconds=3.0,
+            )
+
+    root = tmp_path / "session"
+    root.mkdir()
+    subtitle_path = root / "subtitles" / "commentary.srt"
+    commentary_module._deliver_startup_message(
+        message=message,
+        mode="resume",
+        realtime=FakeRealtime(),
+        subtitle_writer=commentary_module.SrtSubtitleWriter(subtitle_path),
+        root=root,
+        persona="人間を知りたいAI。",
+        playback=True,
+        generation_errors=[],
+        response=None,
+    )
+
+    assert [call["phase"] for call in calls] == [
+        "startup",
+        "startup_retry",
+    ]
+    assert calls[0]["playback_prefix"] == (
+        "ごきげんよう。人間を学ぶ実況AI、スカイナです。"
+    )
+    assert "Mandatory retry correction" in calls[1]["instructions"]
+    assert (root / "startup_rejected_001_transcript.txt").read_text(
+        encoding="utf-8"
+    ).strip() == invalid_transcript
+    assert (root / "startup_transcript.txt").read_text(
+        encoding="utf-8"
+    ).strip() == message
+    subtitles = subtitle_path.read_text(encoding="utf-8-sig")
+    assert subtitles.count(" --> ") == 1
+
+
+def test_startup_continues_when_both_guarded_attempts_are_rejected(
+    tmp_path,
+) -> None:
+    calls: list[dict] = []
+
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            calls.append(kwargs)
+            return SpeechResult(
+                phase=str(kwargs["phase"]),
+                transcript="それでは、始めますね。ごきげんよう。",
+                audio_bytes=100,
+                response_id="rejected",
+                playback_suppressed=True,
+            )
+
+    root = tmp_path / "session"
+    root.mkdir()
+    subtitle_path = root / "subtitles" / "commentary.srt"
+    commentary_module._deliver_startup_message(
+        message="ごきげんよう。スカイナです。",
+        mode="resume",
+        realtime=FakeRealtime(),
+        subtitle_writer=commentary_module.SrtSubtitleWriter(subtitle_path),
+        root=root,
+        persona="",
+        playback=True,
+        generation_errors=[],
+        response=None,
+    )
+
+    assert len(calls) == 2
+    assert " --> " not in subtitle_path.read_text(encoding="utf-8-sig")
+    assert (root / "startup_transcript.txt").exists()
 
 
 def test_initial_startup_uses_fixed_file_without_planner(tmp_path) -> None:

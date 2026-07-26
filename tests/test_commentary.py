@@ -107,6 +107,142 @@ def test_speech_result_uses_first_audio_time_and_pcm_duration(
     assert result.audio_bytes == 4_800
 
 
+def test_guarded_playback_waits_for_matching_transcript_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    client = _client()
+    first_audio = b"\x01" * 100
+    second_audio = b"\x02" * 100
+    third_audio = b"\x03" * 100
+    events = iter(
+        [
+            {
+                "type": "response.output_audio.delta",
+                "delta": base64.b64encode(first_audio).decode("ascii"),
+            },
+            {
+                "type": "response.output_audio_transcript.delta",
+                "delta": "ごきげんよう。",
+            },
+            {
+                "type": "response.output_audio.delta",
+                "delta": base64.b64encode(second_audio).decode("ascii"),
+            },
+            {
+                "type": "response.output_audio_transcript.delta",
+                "delta": "スカイナです。",
+            },
+            {
+                "type": "response.output_audio.delta",
+                "delta": base64.b64encode(third_audio).decode("ascii"),
+            },
+            {
+                "type": "response.done",
+                "response": {"id": "response-1", "status": "completed"},
+            },
+        ]
+    )
+    played: list[bytes] = []
+
+    class FakeAudioSink:
+        def __init__(self, *args, **kwargs) -> None:
+            self.started = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def start_playback(self) -> bool:
+            self.started = True
+            return True
+
+        def write(self, chunk: bytes) -> None:
+            if self.started:
+                played.append(chunk)
+
+        def play_buffered(self, chunk: bytes) -> None:
+            played.append(chunk)
+
+    client._send = lambda event: None  # type: ignore[method-assign]
+    client._receive = lambda: next(events)  # type: ignore[method-assign]
+    monkeypatch.setattr(commentary_module, "AudioSink", FakeAudioSink)
+
+    result = client.speak(
+        phase="startup",
+        instructions="完成稿だけを話す",
+        wav_path=tmp_path / "startup.wav",
+        playback=True,
+        playback_prefix="ごきげんよう。スカイナです。",
+    )
+
+    assert result.playback_suppressed is False
+    assert played == [first_audio + second_audio, third_audio]
+
+
+def test_guarded_playback_suppresses_unplanned_startup_preface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    client = _client()
+    audio = b"\x01" * 100
+    events = iter(
+        [
+            {
+                "type": "response.output_audio.delta",
+                "delta": base64.b64encode(audio).decode("ascii"),
+            },
+            {
+                "type": "response.output_audio_transcript.delta",
+                "delta": "ごきげんよう。それでは、続きを始めますね。",
+            },
+            {
+                "type": "response.done",
+                "response": {"id": "response-1", "status": "completed"},
+            },
+        ]
+    )
+    played: list[bytes] = []
+
+    class FakeAudioSink:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def start_playback(self) -> bool:
+            played.append(b"started")
+            return True
+
+        def write(self, chunk: bytes) -> None:
+            pass
+
+        def play_buffered(self, chunk: bytes) -> None:
+            played.append(chunk)
+
+    client._send = lambda event: None  # type: ignore[method-assign]
+    client._receive = lambda: next(events)  # type: ignore[method-assign]
+    monkeypatch.setattr(commentary_module, "AudioSink", FakeAudioSink)
+
+    result = client.speak(
+        phase="startup",
+        instructions="完成稿だけを話す",
+        wav_path=tmp_path / "startup.wav",
+        playback=True,
+        playback_prefix="ごきげんよう。人間を学ぶ実況AI、スカイナです。",
+    )
+
+    assert result.playback_suppressed is True
+    assert result.started_at_seconds is None
+    assert played == []
+
+
 class _FakeResponsesResponse:
     def __init__(self, payload: dict) -> None:
         self._payload = payload
