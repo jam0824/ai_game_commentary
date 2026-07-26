@@ -5,6 +5,7 @@ description = "Capture a Windows game window and extract Japanese text with NDLO
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    "httpx>=0.28.1",
     "ndlocr-lite",
     "numpy>=2.0",
     "opencv-python-headless>=4.8",

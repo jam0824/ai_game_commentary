@@ -15,6 +15,7 @@ name = "ai-game-commentary"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "ndlocr-lite" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
@@ -30,6 +31,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "ndlocr-lite", git = "https://github.com/ndl-lab/ndlocr-lite.git?rev=7fd36cd58df7df1270ac19c7231988a77ec980ab" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "opencv-python-headless", specifier = ">=4.8" },

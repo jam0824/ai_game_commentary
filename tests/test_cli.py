@@ -1,4 +1,5 @@
 import json
+from threading import Event
 
 import pytest
 from PIL import Image, ImageDraw
@@ -118,6 +119,9 @@ def test_obs_capture_window_opens_before_ocr_initialization(
         "ocr_initialization",
         "obs_window_closed",
     ]
+    assert (
+        tmp_path / "subtitles" / "commentary.srt"
+    ).read_bytes() == b"\xef\xbb\xbf"
 
 
 def test_prepare_ocr_image_crops_and_scales() -> None:
@@ -321,14 +325,30 @@ def test_choice_speech_retries_until_selection_is_confirmed(
             "この返事の後が気になるよね。ここはBを選ぶね。",
         ]
     )
+    attempts: list[SpeechResult] = []
+    utterance = choice_utterance(plan)
+    subtitle_writer = commentary_module.SrtSubtitleWriter(
+        tmp_path / "subtitles" / "commentary.srt"
+    )
+
+    def record_attempt(speech: SpeechResult) -> None:
+        attempts.append(speech)
+        commentary_module._append_speech_subtitle(
+            subtitle_writer,
+            utterance,
+            speech,
+        )
 
     class FakeRealtime:
         def speak(self, **kwargs) -> SpeechResult:
+            attempt_number = len(attempts)
             return SpeechResult(
                 phase=str(kwargs["phase"]),
                 transcript=next(transcripts),
                 audio_bytes=10,
                 response_id=None,
+                started_at_seconds=float(attempt_number + 1),
+                ended_at_seconds=float(attempt_number + 2),
             )
 
     monkeypatch.setattr(commentary_module.time, "sleep", lambda seconds: None)
@@ -339,12 +359,22 @@ def test_choice_speech_retries_until_selection_is_confirmed(
         playback=False,
         retries=2,
         retry_delay=0.5,
+        on_speech=record_attempt,
     )
     assert speech.transcript.endswith("Bを選ぶね。")
     assert verification.matches is True
     assert retries == 1
+    assert [attempt.phase for attempt in attempts] == [
+        "choice",
+        "choice_retry",
+    ]
     assert (tmp_path / "choice_transcript.txt").exists()
     assert (tmp_path / "choice_retry_001_transcript.txt").exists()
+    subtitles = (
+        tmp_path / "subtitles" / "commentary.srt"
+    ).read_text(encoding="utf-8-sig")
+    assert subtitles.count(utterance) == 2
+    assert subtitles.count(" --> ") == 2
 
 
 def test_choice_prompt_contains_only_available_labels() -> None:
@@ -394,8 +424,26 @@ def test_main_speaks_choice_before_sending_selection_keys(
         def __exit__(self, exc_type, exc, traceback) -> None:
             pass
 
-        def record_game_text(self, *, turn_number: int, text: str) -> None:
-            events.append("record")
+        def speak(self, **kwargs) -> SpeechResult:
+            events.append("speak")
+            return SpeechResult(
+                phase="choice",
+                transcript=expected_utterance,
+                audio_bytes=100,
+                response_id="choice-speech",
+                started_at_seconds=1.25,
+                ended_at_seconds=2.5,
+            )
+
+    class FakePlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
 
         def generate_text(self, **kwargs) -> TextResult:
             events.append("plan")
@@ -408,21 +456,17 @@ def test_main_speaks_choice_before_sending_selection_keys(
                 response_id="choice-plan",
             )
 
-        def speak(self, **kwargs) -> SpeechResult:
-            events.append("speak")
-            return SpeechResult(
-                phase="choice",
-                transcript=expected_utterance,
-                audio_bytes=100,
-                response_id="choice-speech",
-            )
-
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
     monkeypatch.setattr(
         commentary_module,
         "RealtimeSpeechClient",
         FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FakePlanner,
     )
     monkeypatch.setattr(
         commentary_module,
@@ -452,12 +496,233 @@ def test_main_speaks_choice_before_sending_selection_keys(
     )
 
     assert result == 0
-    assert events == ["record", "plan", "speak", "select:2"]
+    assert events == ["plan", "speak", "select:2"]
     summary = json.loads(
         (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
     )
     assert summary["choice_plan"]["selected_label"] == "C"
     assert summary["selection_performed"] is True
+    assert summary["choice_speech"]["started_at_seconds"] == 1.25
+    assert summary["choice_speech"]["ended_at_seconds"] == 2.5
+    subtitles = (
+        tmp_path / "subtitles" / "commentary.srt"
+    ).read_text(encoding="utf-8-sig")
+    assert "00:00:01,250 --> 00:00:02,500" in subtitles
+    assert expected_utterance in subtitles
+    assert choice_text not in subtitles
+
+
+def test_main_plans_commentary_while_narration_is_playing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+    plan_started = Event()
+    narration_started = Event()
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            phase = str(kwargs["phase"])
+            if phase == "narration":
+                assert plan_started.wait(timeout=1)
+                events.append("narration")
+                narration_started.set()
+                transcript = "以前交わした約束を、ついに果たした。"
+                started_at_seconds = 0.5
+                ended_at_seconds = 1.5
+            else:
+                events.append("commentary")
+                transcript = "前の約束が、ここにつながったんだね。"
+                started_at_seconds = 2.0
+                ended_at_seconds = 3.25
+            return SpeechResult(
+                phase=phase,
+                transcript=transcript,
+                audio_bytes=100,
+                response_id=f"{phase}-response",
+                started_at_seconds=started_at_seconds,
+                ended_at_seconds=ended_at_seconds,
+            )
+
+    class FakePlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def generate_text(self, **kwargs) -> TextResult:
+            events.append("plan_start")
+            plan_started.set()
+            assert narration_started.wait(timeout=1)
+            return TextResult(
+                text=(
+                    '{"mode":"quick",'
+                    '"comment":"前の約束がここにつながったんだね。",'
+                    '"emotion":"thoughtful","intensity":0.6,"pace":"normal"}'
+                ),
+                response_id="plan-response",
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FakePlanner,
+    )
+
+    result = commentary_module.main(
+        [
+            "--text",
+            "以前交わした約束を、ついに果たした。",
+            "--no-playback",
+            "--no-obs-window",
+            "--output",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    assert events == ["plan_start", "narration", "commentary"]
+    summary = json.loads(
+        (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert summary["model"] == "gpt-realtime-2.1-mini"
+    assert summary["commentary_model"] == "gpt-5.6-luna"
+    assert summary["commentary_api"] == "responses"
+    assert (
+        summary["commentary_plan"]["wait_after_narration_seconds"]
+        is not None
+    )
+    assert summary["commentary"]["started_at_seconds"] == 2.0
+    assert summary["commentary"]["ended_at_seconds"] == 3.25
+    subtitles = (
+        tmp_path / "subtitles" / "commentary.srt"
+    ).read_text(encoding="utf-8-sig")
+    assert "00:00:02,000 --> 00:00:03,250" in subtitles
+    assert "前の約束がここにつながったんだね。" in subtitles
+    assert "以前交わした約束を、ついに果たした。" not in subtitles
+    assert "前の約束が、ここにつながったんだね。" not in subtitles
+
+
+def test_main_excludes_narration_and_silent_turn_from_subtitles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source_text = "静かな廊下を歩いた。"
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            assert kwargs["phase"] == "narration"
+            return SpeechResult(
+                phase="narration",
+                transcript=source_text,
+                audio_bytes=100,
+                response_id="narration-response",
+                started_at_seconds=1.0,
+                ended_at_seconds=2.0,
+            )
+
+    class FakePlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def generate_text(self, **kwargs) -> TextResult:
+            return TextResult(
+                text=(
+                    '{"mode":"silent","comment":"","emotion":"calm",'
+                    '"intensity":0.0,"pace":"normal"}'
+                ),
+                response_id="plan-response",
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FakePlanner,
+    )
+
+    result = commentary_module.main(
+        [
+            "--text",
+            source_text,
+            "--no-playback",
+            "--no-obs-window",
+            "--output",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    assert (
+        tmp_path / "subtitles" / "commentary.srt"
+    ).read_bytes() == b"\xef\xbb\xbf"
 
 
 @pytest.mark.parametrize(
@@ -588,6 +853,70 @@ def test_extract_incremental_text_returns_empty_for_whitespace_only_change() -> 
     assert extract_incremental_text(
         "アタックで、何度かデートをした。",
         "アタックで、　何度かデートをした。",
+    ) == ""
+
+
+def test_extract_incremental_text_tolerates_dropped_ellipsis_in_old_text() -> None:
+    previous = (
+        "「すいません。一緒に写ってもらえませんか?」"
+        "三人組の一人、メガネをかけた女の子がデジタル"
+        "カメラを差し出しながら、ぼく達に話しかけて来た。"
+        "……来たな。"
+    )
+    current = (
+        "「すいません。一緒に写ってもらえませんか?」"
+        "三人組の一人、メガネをかけた女の子がデジタル"
+        "カメラを差し出しながら、ぼく達に話しかけて来た。"
+        "来たな。"
+        "これだから、男前はこまるよ……。"
+    )
+
+    assert extract_incremental_text(previous, current) == (
+        "これだから、男前はこまるよ……。"
+    )
+
+
+def test_extract_incremental_text_tolerates_inserted_ocr_noise() -> None:
+    previous = (
+        "「ああ、別に構いませんよ。さて、どんなボーズで…"
+        "ところが、メガネの子は慌ててぼくを押しとどめる。"
+    )
+    current = (
+        "「ああ、別に構いませんよ。さて、どんなボーズで…"
+        "000J"
+        "ところが、メガネの子は慌ててぼくを押しとどめる。"
+        "「あ、マネージャーの方はけっこうですから」"
+    )
+
+    assert extract_incremental_text(previous, current) == (
+        "「あ、マネージャーの方はけっこうですから」"
+    )
+
+
+def test_extract_incremental_text_tolerates_changed_ocr_noise() -> None:
+    previous = (
+        "「ああ、別に構いませんよ。さて、どんなボーズで…"
+        "000J"
+        "ところが、メガネの子は慌ててぼくを押しとどめる。"
+        "「あ、マネージャーの方はけっこうですから」"
+    )
+    current = (
+        "「ああ、別に構いませんよ。さて、どんなボーズで…"
+        "COOJ"
+        "ところが、メガネの子は慌ててぼくを押しとどめる。"
+        "「あ、マネージャーの方はけっこうですから」"
+        "……マネー……ジャー?"
+    )
+
+    assert extract_incremental_text(previous, current) == (
+        "……マネー……ジャー?"
+    )
+
+
+def test_extract_incremental_text_returns_empty_for_ocr_only_change() -> None:
+    assert extract_incremental_text(
+        "長めの文章の途中に画像由来の000Jという誤認識が入った。",
+        "長めの文章の途中に画像由来のCOOJという誤認識が入った。",
     ) == ""
 
 
