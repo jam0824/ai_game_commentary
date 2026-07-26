@@ -31,6 +31,60 @@ def test_parse_crop() -> None:
     assert parse_crop("10, 20, 300, 200") == (10, 20, 300, 200)
 
 
+def test_obs_capture_window_is_enabled_by_default() -> None:
+    args = commentary_module._build_parser().parse_args([])
+    assert args.no_obs_window is False
+
+
+def test_obs_capture_window_can_be_disabled() -> None:
+    args = commentary_module._build_parser().parse_args(["--no-obs-window"])
+    assert args.no_obs_window is True
+
+
+def test_obs_capture_window_opens_before_ocr_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+
+    class FakeObsWindow:
+        error = None
+        is_open = True
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is True
+
+        def __enter__(self):
+            events.append("obs_window")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            events.append("obs_window_closed")
+
+    class StoppingOcr:
+        def __init__(self) -> None:
+            events.append("ocr_initialization")
+            raise RuntimeError("テスト終了")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", StoppingOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(1, title, 960, 540),
+    )
+
+    result = commentary_module.main(["--output", str(tmp_path)])
+
+    assert result == 1
+    assert events == [
+        "obs_window",
+        "ocr_initialization",
+        "obs_window_closed",
+    ]
+
+
 def test_prepare_ocr_image_crops_and_scales() -> None:
     image = Image.new("RGB", (640, 360))
     prepared = prepare_ocr_image(

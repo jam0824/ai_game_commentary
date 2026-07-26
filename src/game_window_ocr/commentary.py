@@ -28,6 +28,7 @@ from .cli import (
     prepare_ocr_image,
 )
 from .persistent_ocr import PersistentNdlOcr
+from .obs_window import OBS_WINDOW_TITLE, ObsCaptureWindow
 from .windows import (
     WindowInfo,
     capture_client,
@@ -1104,6 +1105,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="スピーカー再生せずWAVファイルだけ保存します。",
     )
     parser.add_argument(
+        "--no-obs-window",
+        action="store_true",
+        help="OBSのアプリ音声キャプチャ用ウィンドウを表示しません。",
+    )
+    parser.add_argument(
         "--after-enter-delay",
         type=float,
         default=1.0,
@@ -1249,20 +1255,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     root.mkdir(parents=True, exist_ok=True)
 
-    fixed_text = _source_text(args)
-    window: WindowInfo | None = None
-    if fixed_text is None or args.press_enter:
-        try:
+    app_stack = ExitStack()
+    try:
+        obs_window = app_stack.enter_context(
+            ObsCaptureWindow(
+                enabled=not args.no_playback and not args.no_obs_window
+            )
+        )
+        if obs_window.error is not None:
+            print(
+                "警告: OBS音声キャプチャ用ウィンドウを表示できませんでした: "
+                f"{obs_window.error}",
+                file=sys.stderr,
+            )
+        elif obs_window.is_open:
+            print(
+                "OBS音声キャプチャ対象: "
+                f"[python.exe]: {OBS_WINDOW_TITLE}"
+            )
+
+        fixed_text = _source_text(args)
+        window: WindowInfo | None = None
+        if fixed_text is None or args.press_enter:
             window = find_window(args.title)
             print(f"対象: {window.title} (HWND=0x{window.hwnd:X})")
-        except LookupError as exc:
-            print(f"エラー: {exc}", file=sys.stderr)
-            return 1
-    if fixed_text is not None and args.max_turns != 1:
-        print("警告: --text/--text-file では1回だけ処理します。", file=sys.stderr)
+        if fixed_text is not None and args.max_turns != 1:
+            print(
+                "警告: --text/--text-file では1回だけ処理します。",
+                file=sys.stderr,
+            )
 
-    turns = 1 if fixed_text is not None else args.max_turns
-    try:
+        turns = 1 if fixed_text is not None else args.max_turns
         ocr_engine: PersistentNdlOcr | None = None
         if fixed_text is None:
             print("NDLOCRモデルを初期化しています（この実行中は1回だけ）...")
@@ -1538,9 +1561,17 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"\n結果: {root.resolve()}")
         return 0
-    except (OSError, RuntimeError, ValueError, websocket.WebSocketException) as exc:
+    except (
+        LookupError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        websocket.WebSocketException,
+    ) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
+    finally:
+        app_stack.close()
 
 
 if __name__ == "__main__":
