@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+import cv2
+import numpy as np
 import websocket
+from PIL import Image
 
 from .cli import (
     DEFAULT_TITLE,
@@ -38,6 +41,80 @@ DEFAULT_MODEL = "gpt-realtime-2.1-mini"
 DEFAULT_COMMENTARY_MODEL = "gpt-realtime-2.1"
 DEFAULT_VOICE = "marin"
 SAMPLE_RATE = 24_000
+COMMENTARY_PLAN_REVISIONS = 3
+MARKER_REFERENCE_SIZE = (960, 540)
+MARKER_MATCH_THRESHOLD = 0.78
+TRIANGLE_CONTOUR_SCORE = 0.90
+
+_TRIANGLE_MARKER_ROWS = (
+    "..........................",
+    "..........................",
+    "..........................",
+    "..........................",
+    "..........................",
+    ".......###................",
+    ".......####...............",
+    ".......#####..............",
+    ".......######.............",
+    ".......#######............",
+    ".......########...........",
+    ".......#########..........",
+    ".......##########.........",
+    ".......###########........",
+    ".......############.......",
+    ".......############.......",
+    ".......############.......",
+    ".......############.......",
+    ".......###########........",
+    ".......##########.........",
+    ".......##########.........",
+    ".......########...........",
+    ".......########...........",
+    ".......#######............",
+    ".......######.............",
+    ".......#####..............",
+    ".......####...............",
+    ".......###................",
+    "..........................",
+    "..........................",
+    "..........................",
+    "..........................",
+)
+
+_BOOK_MARKER_ROWS = (
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "...................##...........",
+    "..................##............",
+    "..................##............",
+    ".................###............",
+    ".....#####......#########.......",
+    ".....#######....#########.......",
+    ".....########...#########.......",
+    ".....#########..#########.......",
+    ".....########...##########......",
+    ".....########...##########......",
+    ".....########...##########......",
+    ".....########...##########......",
+    ".....########...##########......",
+    ".....########...##########......",
+    ".....########...##########......",
+    ".....########...###.######......",
+    ".....########...##.######.......",
+    ".....########...#.#######.......",
+    ".....########...#.#######.......",
+    "...........##...................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+)
 
 
 @dataclass(frozen=True)
@@ -63,11 +140,221 @@ class CommentaryPlan:
     pace: str
 
 
+@dataclass(frozen=True)
+class AdvanceMarker:
+    kind: str
+    score: float
+    location: tuple[int, int] | None
+    waited_seconds: float = 0.0
+    retry_count: int = 0
+
+
 COMMENTARY_EMOTIONS = frozenset(
     {"calm", "amused", "excited", "surprised", "tense", "sad", "thoughtful"}
 )
 COMMENTARY_PACES = frozenset({"slow", "normal", "fast"})
 COMMENTARY_MODES = frozenset({"silent", "reaction", "quick", "extended"})
+
+
+def _marker_template(rows: tuple[str, ...]) -> np.ndarray:
+    return np.array(
+        [[255 if char == "#" else 0 for char in row] for row in rows],
+        dtype=np.uint8,
+    )
+
+
+def _detect_triangle_contour(
+    grayscale: np.ndarray,
+) -> tuple[float, tuple[int, int]] | None:
+    """Detect the outlined cursor even when its white fill blends into the scene."""
+    image_height, image_width = grayscale.shape
+    scale_x = image_width / MARKER_REFERENCE_SIZE[0]
+    scale_y = image_height / MARKER_REFERENCE_SIZE[1]
+    dark_pixels = np.where(grayscale < 120, 255, 0).astype(np.uint8)
+    contours, _hierarchy = cv2.findContours(
+        dark_pixels,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        if not (
+            max(3, round(12 * scale_x))
+            <= width
+            <= max(4, round(19 * scale_x))
+            and max(5, round(22 * scale_y))
+            <= height
+            <= max(6, round(31 * scale_y))
+        ):
+            continue
+        if not (
+            120 * scale_x <= x <= 860 * scale_x
+            and 20 * scale_y <= y <= 420 * scale_y
+        ):
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, 0.05 * perimeter, True)
+        if len(polygon) != 3:
+            continue
+        points = polygon.reshape(-1, 2)
+        apex_index = int(np.argmax(points[:, 0]))
+        apex = points[apex_index]
+        left_points = np.delete(points, apex_index, axis=0)
+        if apex[0] - int(np.max(left_points[:, 0])) < 0.35 * width:
+            continue
+        if abs(apex[1] - (y + height / 2)) > 0.30 * height:
+            continue
+        if int(np.ptp(left_points[:, 1])) < 0.60 * height:
+            continue
+        fill_ratio = cv2.contourArea(contour) / (width * height)
+        if 0.40 <= fill_ratio <= 0.75:
+            return TRIANGLE_CONTOUR_SCORE, (x, y)
+    return None
+
+
+def detect_advance_marker(
+    image: Image.Image,
+    *,
+    threshold: float = MARKER_MATCH_THRESHOLD,
+) -> AdvanceMarker:
+    grayscale = np.asarray(image.convert("L"))
+    _threshold, binary = cv2.threshold(
+        grayscale,
+        160,
+        255,
+        cv2.THRESH_BINARY,
+    )
+    scale_x = image.width / MARKER_REFERENCE_SIZE[0]
+    scale_y = image.height / MARKER_REFERENCE_SIZE[1]
+    matches: list[tuple[str, float, tuple[int, int]]] = []
+    triangle_contour = _detect_triangle_contour(grayscale)
+    if triangle_contour is not None:
+        score, location = triangle_contour
+        matches.append(("triangle", score, location))
+    for kind, rows in (
+        ("triangle", _TRIANGLE_MARKER_ROWS),
+        ("book", _BOOK_MARKER_ROWS),
+    ):
+        template = _marker_template(rows)
+        target_width = max(3, round(template.shape[1] * scale_x))
+        target_height = max(3, round(template.shape[0] * scale_y))
+        if (target_width, target_height) != (
+            template.shape[1],
+            template.shape[0],
+        ):
+            template = cv2.resize(
+                template,
+                (target_width, target_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        if (
+            binary.shape[0] < template.shape[0]
+            or binary.shape[1] < template.shape[1]
+        ):
+            continue
+        result = cv2.matchTemplate(
+            binary,
+            template,
+            cv2.TM_CCOEFF_NORMED,
+        )
+        _minimum, maximum, _minimum_location, maximum_location = cv2.minMaxLoc(
+            result
+        )
+        matches.append((kind, float(maximum), maximum_location))
+
+    if not matches:
+        return AdvanceMarker("none", 0.0, None)
+    kind, score, location = max(matches, key=lambda match: match[1])
+    if score < threshold:
+        return AdvanceMarker("none", score, location)
+    return AdvanceMarker(kind, score, location)
+
+
+def wait_for_advance_marker(
+    window: WindowInfo,
+    *,
+    activate: bool,
+    timeout: float,
+    poll_interval: float,
+    threshold: float = MARKER_MATCH_THRESHOLD,
+) -> tuple[Image.Image, AdvanceMarker]:
+    started = time.monotonic()
+    first_capture = True
+    best = AdvanceMarker("none", 0.0, None)
+    while True:
+        image = capture_client(
+            window,
+            activate=activate and first_capture,
+        )
+        first_capture = False
+        marker = detect_advance_marker(image, threshold=threshold)
+        if marker.score > best.score:
+            best = marker
+        elapsed = time.monotonic() - started
+        if marker.kind != "none":
+            return image, AdvanceMarker(
+                marker.kind,
+                marker.score,
+                marker.location,
+                waited_seconds=elapsed,
+            )
+        if elapsed >= timeout:
+            return image, AdvanceMarker(
+                "none",
+                best.score,
+                best.location,
+                waited_seconds=elapsed,
+            )
+        time.sleep(poll_interval)
+
+
+def wait_for_advance_marker_with_retries(
+    window: WindowInfo,
+    *,
+    activate: bool,
+    timeout: float,
+    poll_interval: float,
+    threshold: float,
+    retries: int,
+    retry_delay: float,
+    retry_capture_path: Path | None = None,
+) -> tuple[Image.Image, AdvanceMarker]:
+    retry_count = 0
+    total_started = time.monotonic()
+    while True:
+        image, marker = wait_for_advance_marker(
+            window,
+            activate=activate,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            threshold=threshold,
+        )
+        if marker.kind != "none":
+            return image, AdvanceMarker(
+                marker.kind,
+                marker.score,
+                marker.location,
+                waited_seconds=time.monotonic() - total_started,
+                retry_count=retry_count,
+            )
+
+        retry_count += 1
+        if retry_capture_path is not None:
+            image.save(retry_capture_path)
+        if retries > 0 and retry_count > retries:
+            raise RuntimeError(
+                "文字送りの三角・本マークを検出できませんでした"
+                f"（{timeout:.1f}秒 × {retry_count}回、"
+                f"最高一致度={marker.score:.3f}）。Enterは送りません。"
+            )
+        retry_label = "無制限" if retries == 0 else str(retries)
+        print(
+            "文字送りマークをまだ検出できません"
+            f"（最高一致度={marker.score:.3f}）。"
+            f"{retry_delay:.1f}秒後に再試行します"
+            f"（{retry_count}/{retry_label}、Ctrl+Cで停止）。"
+        )
+        time.sleep(retry_delay)
 
 
 def build_narration_prompt(text: str) -> str:
@@ -91,12 +378,18 @@ def build_narration_prompt(text: str) -> str:
 def build_commentary_prompt(
     text: str,
     *,
-    turns_since_spoken: int | None = None,
+    page_text: str | None = None,
+    advance_marker: str = "unknown",
+    page_has_spoken: bool = False,
+    must_speak: bool = False,
 ) -> str:
     payload = {
         "new_game_text": collapse_visual_line_breaks(text),
+        "current_page_text": collapse_visual_line_breaks(page_text or text),
+        "advance_marker": advance_marker,
+        "page_has_spoken": page_has_spoken,
+        "must_speak": must_speak,
         "task": "commentary",
-        "turns_since_spoken": turns_since_spoken,
     }
     return (
         "# Role\n"
@@ -109,25 +402,45 @@ def build_commentary_prompt(
         "- reaction: 驚き、恐怖、笑い、成功などへ反射的に声が出る場面。"
         "1～12文字の『うわっ！』『えっ、待って！』『よし！』のような反応だけ。\n"
         "- quick: 小さな新事実、人物らしさ、軽い疑問やツッコミ。"
-        "8～35文字の自然な1文。\n"
+        "通常は8～35文字の自然な1文。bookでは後述のページ末ルールを優先する。\n"
         "- extended: 事件の急展開、決定的な証拠、重大な選択、伏線回収、"
-        "人物関係を覆す事実。最大2文・合計90文字。\n"
+        "人物関係を覆す事実。通常は最大2文・合計90文字。\n"
         "- モードを順番に回したり、無理に変化を付けたりしない。"
         "extendedは本当に重要な時だけ使う。\n\n"
         "# Cadence\n"
-        "- 文字送りが細かいゲームなので、通常時は全ターンの70～80%程度をsilentにする。\n"
-        "- ひとつの場面を細切れにしただけの追加文では、意味がまとまるまでsilentで待つ。\n"
-        "- turns_since_spokenが1または2なら、quickではなくsilentにする。"
-        "ただし突然の驚きに対するreactionと、本当に重大なextendedは出してよい。\n"
-        "- 発話する価値があるか少しでも迷ったらsilent。沈黙を不自然だと考えない。\n\n"
+        "- advance_markerがtriangleなら通常の細かい文字送り。突然の展開にはreaction、"
+        "重大な発見にはextended、それ以外はsilent。triangleではquickを使わない。\n"
+        "- advance_markerがbookなら現在の文章ページの終端。page_has_spokenがfalseなら"
+        "ページ全体を踏まえ、quickまたはextendedを必ず選ぶ。bookではreactionを"
+        "単独で使わない。\n"
+        "- must_speakがtrueのときsilentは禁止。ページ内容に大事件がなくても、"
+        "軽い共感、ツッコミ、率直な印象のquickを話す。\n"
+        "- page_has_spokenがtrueなら、bookでも新たに話す価値がなければsilentでよい。\n"
+        "- current_page_textは、このページでここまで朗読した本文。bookでの感想は"
+        "new_game_textだけでなく、このページ全体を材料にする。\n\n"
+        "# Page-end Length\n"
+        "- bookで発話するときは、一言だけで切らず、短めの2～3文・合計28～90文字にする。\n"
+        "- 1文目で素直に反応し、2文目以降で理由、共感、軽い予想、ツッコミのどれかを"
+        "自然に足す。本文の要約で文字数を埋めない。\n"
+        "- 少なくとも1文は『〜だよね』『〜だね』『〜かも』『〜じゃない？』"
+        "『〜かな』など、友達へ話しかける柔らかい語尾にする。\n"
+        "- 普通のページはquick、重大な展開のページだけextendedを選ぶ。\n\n"
+        "# Personality and Tone\n"
+        "- 20代くらいの女性が、仲のいい友達と隣でゲームを遊んでいるように話す。"
+        "明るく親しみやすく、感情や共感が自然ににじむ口調にする。\n"
+        "- 丁寧語や硬い断定より、普段の柔らかい会話を優先する。"
+        "ただし作り込んだアニメ口調や、過度に甘い・幼い話し方にはしない。\n"
+        "- 文末をぶっきらぼうな『〜だな』『〜だろ』だけで落とさない。"
+        "『〜だよね』『〜だね』『〜かも』『〜じゃない？』『〜よねー』"
+        "『〜な気がする』『〜かな』などを、内容に合わせて自然に使い分ける。\n"
+        "- 全文を同じ語尾にしない。断定、共感、疑問、予想を混ぜて会話らしい"
+        "リズムを作る。\n\n"
         "# Style\n"
-        "- 友達と隣で遊んでいる若い成人のような、くだけた自然な口調で話す。"
-        "丁寧語より普段の会話を優先する。\n"
         "- 実況者本人の率直な反応、ツッコミ、共感、予想として話す。\n"
         "- 本文の復唱、要約、作品講評、詩的・抽象的・意味深なコピーは禁止。\n"
         "- 本文にない出来事や設定を作らず、普通の日常語で自然に言い切る。\n"
-        "- 相づちや語尾は『へぇ』『あ、なるほど』『え、マジ？』『〜なんだよね〜』"
-        "『〜じゃん』『〜かも』『〜だな』などを、場面に合う時だけ参考にする。\n"
+        "- 相づちは『へぇ』『あ、なるほど』『え、マジ？』などを、"
+        "場面に合う時だけ参考にする。\n"
         "- サンプルをそのまま毎回使わない。同じ相づち・冒頭・語尾を連続させず、"
         "言い回しに自然な変化を付ける。\n"
         "- 無理な若者言葉、過剰なネットスラング、乱暴な口調、キャラを作りすぎた"
@@ -142,6 +455,12 @@ def build_commentary_prompt(
         "→ quick / 『へぇ、スキー場ってそうなんだ。』\n"
         "- 『真理なら、とぼくは思った。』"
         "→ quick / 『透、真理のこと気になってるんだよね〜。』\n"
+        "- 食い気が強いけれど愛嬌のある女の子を紹介するページの終端"
+        "→ quick / 『食い気全開なの、ちょっと笑えるよねー。"
+        "でもパンダみたいな愛嬌があるっていうの、なんかわかるかも。』\n"
+        "- 落ち着いていて仕事ができそうな女の子を紹介するページの終端"
+        "→ quick / 『この子、落ち着いてて頼りになりそうだよね。"
+        "眼鏡も似合ってるし、まとめ役っぽいかも。』\n"
         "- 犯人につながる証拠が過去の証言と矛盾した"
         "→ extended / 『あ、これ証言と食い違ってるじゃん。"
         "さっきのアリバイ、かなり怪しくなってきたかも。』\n"
@@ -149,7 +468,10 @@ def build_commentary_prompt(
         "# Delivery\n"
         "- emotionは calm/amused/excited/surprised/tense/sad/thoughtful "
         "から選ぶ。silentではcalm。\n"
-        "- intensityは0.0～1.0。silentは0、通常は0.2～0.45。\n"
+        "- intensityは0.0～1.0。silentは0、reactionは0.8～1.0、"
+        "quickは0.45～0.70、extendedは0.65～0.90。\n"
+        "- 発話する場面では、普段の会話より感情を一段大きくして配信映えを優先する。"
+        "ただし絶叫し続けたり、内容以上に深刻な芝居をしたりしない。\n"
         "- paceは slow/normal/fast から選ぶ。\n"
         "- JSONオブジェクトだけを出力する。\n"
         '{"mode":"silent","comment":"","emotion":"calm",'
@@ -245,32 +567,65 @@ def parse_commentary_plan(raw_text: str) -> CommentaryPlan:
     )
 
 
-def commentary_plan_issue(plan: CommentaryPlan) -> str | None:
+def commentary_plan_issue(
+    plan: CommentaryPlan,
+    *,
+    must_speak: bool = False,
+    advance_marker: str = "unknown",
+) -> str | None:
+    if must_speak and plan.mode == "silent":
+        return "ページ終端で未発話のためsilentは禁止です"
+    if advance_marker == "triangle" and plan.mode == "quick":
+        return "通常の文字送りではquickを使いません"
     if plan.mode == "silent":
         if plan.comment:
             return "silentなのにcommentが空ではありません"
         return None
     if not plan.comment or plan.comment == "……。":
         return f"{plan.mode}なのに有効なcommentがありません"
-    if plan.mode == "reaction":
-        limit = 12
-    elif plan.mode == "quick":
-        limit = 35
-    else:
-        limit = 90
-    if len(plan.comment) > limit:
-        return (
-            f"{plan.mode}の上限{limit}文字を超えています"
-            f"（{len(plan.comment)}文字）"
+    sentence_ends = len(re.findall(r"[。！？!?]+", plan.comment))
+    if advance_marker == "book":
+        if plan.mode == "reaction":
+            return "ページ終端ではreactionだけでなく2～3文の感想を話してください"
+        if len(plan.comment) < 28:
+            return (
+                "ページ終端の感想が28文字未満で短すぎます"
+                f"（{len(plan.comment)}文字）"
+            )
+        if len(plan.comment) > 90:
+            return (
+                "ページ終端の感想が90文字を超えています"
+                f"（{len(plan.comment)}文字）"
+            )
+        if sentence_ends < 2:
+            return "ページ終端の感想が1文だけです。2～3文にしてください"
+        if sentence_ends > 3:
+            return "ページ終端の感想が4文以上あります。2～3文にしてください"
+        soft_ending = re.search(
+            r"(?:よね|だね|かも|じゃない|かな|気がする|っぽい|でしょ|じゃん)"
+            r"(?=[。！？!?…〜～ー]|$)",
+            plan.comment,
         )
-    if plan.mode == "quick" and len(plan.comment) < 8:
-        return f"quickなのに8文字未満です（{len(plan.comment)}文字）"
-    if plan.mode in {"reaction", "quick"}:
-        sentence_ends = len(re.findall(r"[。！？!?]+", plan.comment))
+        if not soft_ending:
+            return "ページ終端の感想に、友達へ話しかける柔らかい語尾がありません"
+    else:
+        if plan.mode == "reaction":
+            limit = 12
+        elif plan.mode == "quick":
+            limit = 35
+        else:
+            limit = 90
+        if len(plan.comment) > limit:
+            return (
+                f"{plan.mode}の上限{limit}文字を超えています"
+                f"（{len(plan.comment)}文字）"
+            )
+        if plan.mode == "quick" and len(plan.comment) < 8:
+            return f"quickなのに8文字未満です（{len(plan.comment)}文字）"
+    if advance_marker != "book" and plan.mode in {"reaction", "quick"}:
         if sentence_ends > 1:
             return f"{plan.mode}なのに2文以上あります"
-    if plan.mode == "extended":
-        sentence_ends = len(re.findall(r"[。！？!?]+", plan.comment))
+    if advance_marker != "book" and plan.mode == "extended":
         if sentence_ends > 2:
             return "extendedなのに3文以上あります"
     banned = (
@@ -294,29 +649,36 @@ def commentary_plan_issue(plan: CommentaryPlan) -> str | None:
     )
     if nominal_ending:
         return f"体言止め「{nominal_ending.group(1)}」で終わっています"
+    blunt_ending = re.search(
+        r"(だな(?:あ|ぁ)?|だろ(?:う)?)(?=[。！？!?…〜～ー]|$)",
+        plan.comment,
+    )
+    if blunt_ending:
+        return f"ぶっきらぼうな語尾「{blunt_ending.group(1)}」を含んでいます"
     return None
 
 
-def apply_commentary_cooldown(
+def apply_commentary_intensity_boost(
     plan: CommentaryPlan,
-    *,
-    turns_since_spoken: int | None,
-) -> tuple[CommentaryPlan, str | None]:
-    if (
-        plan.mode != "quick"
-        or turns_since_spoken is None
-        or turns_since_spoken > 2
-    ):
-        return plan, None
+) -> tuple[CommentaryPlan, bool]:
+    minimum = {
+        "silent": 0.0,
+        "reaction": 0.85,
+        "quick": 0.55,
+        "extended": 0.70,
+    }[plan.mode]
+    boosted_intensity = max(plan.intensity, minimum)
+    if boosted_intensity == plan.intensity:
+        return plan, False
     return (
         CommentaryPlan(
-            comment="",
-            mode="silent",
-            emotion="calm",
-            intensity=0.0,
-            pace="normal",
+            comment=plan.comment,
+            mode=plan.mode,
+            emotion=plan.emotion,
+            intensity=boosted_intensity,
+            pace=plan.pace,
         ),
-        f"quick_cooldown_after_{turns_since_spoken}_turns",
+        True,
     )
 
 
@@ -325,16 +687,22 @@ def build_commentary_revision_prompt(
     plan: CommentaryPlan,
     issue: str,
     *,
-    turns_since_spoken: int | None = None,
+    page_text: str | None = None,
+    advance_marker: str = "unknown",
+    page_has_spoken: bool = False,
+    must_speak: bool = False,
 ) -> str:
     return (
         build_commentary_prompt(
             text,
-            turns_since_spoken=turns_since_spoken,
+            page_text=page_text,
+            advance_marker=advance_marker,
+            page_has_spoken=page_has_spoken,
+            must_speak=must_speak,
         )
         + "\n\n# Revision required\n"
         + f"直前の案は不採用です。理由: {issue}。\n"
-        + "意味を短く切り落とすだけでなく、ゲームを遊んでいる本人の自然な一言として"
+        + "意味を短く切り落とすだけでなく、ゲームを遊んでいる本人の自然な実況コメントとして"
         "最初から書き直してください。\n"
         + "直前の案: "
         + json.dumps(asdict(plan), ensure_ascii=False)
@@ -343,13 +711,13 @@ def build_commentary_revision_prompt(
 
 def build_commentary_speech_prompt(plan: CommentaryPlan) -> str:
     emotion_delivery = {
-        "calm": "穏やかで落ち着いた声。力まず、自然に。",
-        "amused": "面白がる明るい声。軽い笑みを含めるが、作り笑いはしない。",
-        "excited": "期待が高まる弾んだ声。勢いは出すが叫ばない。",
-        "surprised": "本当に意外だったような驚き。冒頭を少し鋭くする。",
-        "tense": "不穏さを感じる抑えた声。少し低めで、間を効果的に取る。",
-        "sad": "静かで沈んだ声。大げさに泣かず、余韻を残す。",
-        "thoughtful": "考え込みながら話す声。要点の前後に短い間を置く。",
+        "calm": "明るく余裕のある声。落ち着きつつ、語尾にはっきり抑揚を付ける。",
+        "amused": "本当に面白がる弾んだ声。笑みと軽いツッコミ感をはっきり乗せる。",
+        "excited": "テンションが一気に上がった声。音程と勢いを大きく上げるが絶叫はしない。",
+        "surprised": "思わず声が跳ねる大きな驚き。冒頭を鋭く、音程差をはっきり付ける。",
+        "tense": "息をのむような緊張感。少し低い声と大胆な間で不穏さを強調する。",
+        "sad": "声が明確に沈む悲しさ。テンポを落とし、余韻をしっかり残す。",
+        "thoughtful": "考えがつながった実感のある声。要点を強調し、大きめの間を置く。",
     }[plan.emotion]
     pace_delivery = {
         "slow": "通常より少しゆっくり。",
@@ -368,8 +736,15 @@ def build_commentary_speech_prompt(plan: CommentaryPlan) -> str:
         "あなたは日本語のゲーム実況者です。次のJSONに従って感想を演じてください。\n"
         "- response_textだけを、追加・省略・言い換えせずに話す。\n"
         "- emotion、intensity、paceの名前や数値は発音しない。\n"
-        "- 友達とゲームをしている若い成人のような、くだけた自然な声で話す。"
-        "語尾を伸ばす表記は軽い抑揚として自然に表現し、大げさに引き伸ばさない。\n"
+        "- 仲のいい友達とゲームをしている20代くらいの女性として、"
+        "明るく親しみやすい自然な声で話す。作ったアニメ声や幼い声にはしない。\n"
+        "- 『〜だよね』『〜かも』『〜じゃない？』『〜よねー』などの語尾は、"
+        "ぶっきらぼうに落とさず、相手へ話しかける柔らかい抑揚を付ける。"
+        "伸ばす表記は自然に表現し、過度には引き伸ばさない。\n"
+        "- ゲーム実況として、普段の会話よりリアクションを一段大きくする。"
+        "声量だけに頼らず、音程差、抑揚、間、テンポの変化をはっきり付ける。\n"
+        "- 小さく無難にまとめない。ただし音割れしそうな絶叫や、セリフにない"
+        "笑い声・叫び声は追加しない。\n"
         f"- 感情表現: {emotion_delivery}\n"
         f"- 感情の強さ: {plan.intensity:.2f}。0は抑制的、1は非常に強い。\n"
         f"- 話速: {pace_delivery}\n"
@@ -523,6 +898,9 @@ class RealtimeSpeechClient:
                         "選んでください。"
                         "作品ジャンルを理由に普通の場面まで怪しがらず、詩的なコピーではなく"
                         "実際に口に出す自然な実況口調を使ってください。"
+                        "実況の感想では、仲のいい友達と遊ぶ20代くらいの女性として、"
+                        "明るく親しみやすく話してください。『〜だな』『〜だろ』のような"
+                        "ぶっきらぼうな語尾に偏らず、柔らかい会話調を使ってください。"
                     ),
                 },
             }
@@ -731,6 +1109,36 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Enter送信後、次のキャプチャまで待つ秒数。",
     )
+    parser.add_argument(
+        "--marker-timeout",
+        type=float,
+        default=12.0,
+        help="文字送りの三角・本マークを1回に待つ最大秒数。",
+    )
+    parser.add_argument(
+        "--marker-retries",
+        type=int,
+        default=0,
+        help="マーク待機を再試行する回数。0（既定値）は無制限。",
+    )
+    parser.add_argument(
+        "--marker-retry-delay",
+        type=float,
+        default=1.0,
+        help="マーク待機を再試行するまでの秒数。",
+    )
+    parser.add_argument(
+        "--marker-poll-interval",
+        type=float,
+        default=0.15,
+        help="文字送りマークを再確認する間隔（秒）。",
+    )
+    parser.add_argument(
+        "--marker-threshold",
+        type=float,
+        default=MARKER_MATCH_THRESHOLD,
+        help="文字送りマークの画像一致度しきい値（0.0～1.0）。",
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--text", help="OCRを使わず、この文字列で音声だけ試します。")
@@ -747,8 +1155,22 @@ def _capture_and_ocr(
     turn_dir: Path,
     args: argparse.Namespace,
     ocr_engine: PersistentNdlOcr,
-) -> str:
-    raw = capture_client(window, activate=not args.no_activate)
+) -> tuple[str, AdvanceMarker]:
+    raw, marker = wait_for_advance_marker_with_retries(
+        window,
+        activate=not args.no_activate,
+        timeout=args.marker_timeout,
+        poll_interval=args.marker_poll_interval,
+        threshold=args.marker_threshold,
+        retries=args.marker_retries,
+        retry_delay=args.marker_retry_delay,
+        retry_capture_path=turn_dir / "marker_timeout_latest.png",
+    )
+    print(
+        f"文字送りマーク: {marker.kind} / "
+        f"一致度={marker.score:.3f} / 待機={marker.waited_seconds:.2f}秒 / "
+        f"リトライ={marker.retry_count}回"
+    )
     raw_path = turn_dir / "capture_raw.png"
     raw.save(raw_path)
     prepared = prepare_ocr_image(raw, crop=args.crop, scale=args.scale)
@@ -768,7 +1190,11 @@ def _capture_and_ocr(
         text + ("\n" if text else ""),
         encoding="utf-8",
     )
-    return text
+    (turn_dir / "advance_marker.json").write_text(
+        json.dumps(asdict(marker), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return text, marker
 
 
 def _source_text(args: argparse.Namespace) -> str | None:
@@ -787,6 +1213,30 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.after_enter_delay < 0:
         print("エラー: --after-enter-delay は0以上にしてください。", file=sys.stderr)
+        return 2
+    if args.marker_timeout <= 0:
+        print("エラー: --marker-timeout は0より大きくしてください。", file=sys.stderr)
+        return 2
+    if args.marker_retries < 0:
+        print("エラー: --marker-retries は0以上にしてください。", file=sys.stderr)
+        return 2
+    if args.marker_retry_delay < 0:
+        print(
+            "エラー: --marker-retry-delay は0以上にしてください。",
+            file=sys.stderr,
+        )
+        return 2
+    if args.marker_poll_interval <= 0:
+        print(
+            "エラー: --marker-poll-interval は0より大きくしてください。",
+            file=sys.stderr,
+        )
+        return 2
+    if not 0 <= args.marker_threshold <= 1:
+        print(
+            "エラー: --marker-threshold は0.0～1.0で指定してください。",
+            file=sys.stderr,
+        )
         return 2
 
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -841,15 +1291,22 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             last_text: str | None = None
-            last_spoken_turn: int | None = None
+            page_text_parts: list[str] = []
+            page_has_spoken = False
             for turn_number in range(1, turns + 1):
                 turn_dir = root / f"turn_{turn_number:03d}"
                 turn_dir.mkdir(parents=True, exist_ok=True)
                 text = fixed_text
+                advance_marker = AdvanceMarker("unknown", 0.0, None)
                 if text is None:
                     if window is None or ocr_engine is None:
                         raise RuntimeError("対象ウィンドウがありません。")
-                    text = _capture_and_ocr(window, turn_dir, args, ocr_engine)
+                    text, advance_marker = _capture_and_ocr(
+                        window,
+                        turn_dir,
+                        args,
+                        ocr_engine,
+                    )
                 else:
                     (turn_dir / "source.txt").write_text(
                         text + "\n",
@@ -869,6 +1326,13 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if turn_text != collapse_visual_line_breaks(text):
                     print(f"今回追加された本文:\n{turn_text}")
+                page_text_parts.append(turn_text)
+                page_text = "".join(page_text_parts)
+                page_has_spoken_before = page_has_spoken
+                must_speak = (
+                    advance_marker.kind == "book"
+                    and not page_has_spoken_before
+                )
                 if not args.narration_only:
                     planner.record_game_text(turn_number=turn_number, text=turn_text)
                 print("本文を朗読しています...")
@@ -890,19 +1354,22 @@ def main(argv: list[str] | None = None) -> int:
                 commentary: SpeechResult | None = None
                 commentary_plan: CommentaryPlan | None = None
                 commentary_plan_response: TextResult | None = None
-                commentary_suppressed_reason: str | None = None
+                commentary_intensity_boosted = False
                 if not args.narration_only:
-                    turns_since_spoken = (
-                        None
-                        if last_spoken_turn is None
-                        else turn_number - last_spoken_turn
+                    print(
+                        "感想と演技を決めています..."
+                        f"（mark={advance_marker.kind}, "
+                        f"page_spoken={page_has_spoken_before}, "
+                        f"must_speak={must_speak}）"
                     )
-                    print("感想と演技を決めています...")
                     commentary_plan_response = planner.generate_text(
                         phase="commentary_plan",
                         instructions=build_commentary_prompt(
                             turn_text,
-                            turns_since_spoken=turns_since_spoken,
+                            page_text=page_text,
+                            advance_marker=advance_marker.kind,
+                            page_has_spoken=page_has_spoken_before,
+                            must_speak=must_speak,
                         ),
                         use_conversation_history=True,
                     )
@@ -912,7 +1379,10 @@ def main(argv: list[str] | None = None) -> int:
                             phase="commentary_plan_retry",
                             instructions=build_commentary_prompt(
                                 turn_text,
-                                turns_since_spoken=turns_since_spoken,
+                                page_text=page_text,
+                                advance_marker=advance_marker.kind,
+                                page_has_spoken=page_has_spoken_before,
+                                must_speak=must_speak,
                             ),
                             use_conversation_history=True,
                         )
@@ -923,13 +1393,21 @@ def main(argv: list[str] | None = None) -> int:
                     commentary_plan = parse_commentary_plan(
                         commentary_plan_response.text
                     )
-                    plan_issue = commentary_plan_issue(commentary_plan)
-                    for revision_number in range(1, 3):
+                    plan_issue = commentary_plan_issue(
+                        commentary_plan,
+                        must_speak=must_speak,
+                        advance_marker=advance_marker.kind,
+                    )
+                    for revision_number in range(
+                        1,
+                        COMMENTARY_PLAN_REVISIONS + 1,
+                    ):
                         if plan_issue is None:
                             break
                         print(
                             "感想案を再生成します: "
-                            f"{plan_issue}（{revision_number}/2）"
+                            f"{plan_issue}（{revision_number}/"
+                            f"{COMMENTARY_PLAN_REVISIONS}）"
                         )
                         commentary_plan_response = planner.generate_text(
                             phase=f"commentary_plan_revision_{revision_number}",
@@ -937,7 +1415,10 @@ def main(argv: list[str] | None = None) -> int:
                                 turn_text,
                                 commentary_plan,
                                 plan_issue,
-                                turns_since_spoken=turns_since_spoken,
+                                page_text=page_text,
+                                advance_marker=advance_marker.kind,
+                                page_has_spoken=page_has_spoken_before,
+                                must_speak=must_speak,
                             ),
                             use_conversation_history=True,
                         )
@@ -948,22 +1429,28 @@ def main(argv: list[str] | None = None) -> int:
                         commentary_plan = parse_commentary_plan(
                             commentary_plan_response.text
                         )
-                        plan_issue = commentary_plan_issue(commentary_plan)
-                    if plan_issue is not None:
-                        print(f"警告: 感想案の品質条件を満たせませんでした: {plan_issue}")
-                    commentary_plan, commentary_suppressed_reason = (
-                        apply_commentary_cooldown(
+                        plan_issue = commentary_plan_issue(
                             commentary_plan,
-                            turns_since_spoken=turns_since_spoken,
+                            must_speak=must_speak,
+                            advance_marker=advance_marker.kind,
                         )
+                    if plan_issue is not None:
+                        raise RuntimeError(
+                            "感想案が実況タイミングの条件を満たせませんでした: "
+                            f"{plan_issue}。Enterは送りません。"
+                        )
+                    commentary_plan, commentary_intensity_boosted = (
+                        apply_commentary_intensity_boost(commentary_plan)
                     )
-                    if commentary_suppressed_reason:
-                        print(
-                            "発話間隔を空けるため、quickをsilentへ変更しました。"
-                        )
+                    if commentary_intensity_boosted:
+                        print("配信向けに感情表現の強度を引き上げました。")
                     plan_record = {
                         **asdict(commentary_plan),
-                        "suppressed_reason": commentary_suppressed_reason,
+                        "intensity_boosted": commentary_intensity_boosted,
+                        "advance_marker": advance_marker.kind,
+                        "page_has_spoken_before": page_has_spoken_before,
+                        "must_speak": must_speak,
+                        "page_text": page_text,
                         "raw_response": commentary_plan_response.text,
                         "response_id": commentary_plan_response.response_id,
                     }
@@ -995,7 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
                             encoding="utf-8",
                         )
                         print(f"実況: {commentary.transcript}")
-                        last_spoken_turn = turn_number
+                        page_has_spoken = True
 
                 summary = {
                     "model": args.model,
@@ -1003,12 +1490,16 @@ def main(argv: list[str] | None = None) -> int:
                     "voice": args.voice,
                     "source_text": text,
                     "turn_text": turn_text,
+                    "page_text": page_text,
+                    "advance_marker": asdict(advance_marker),
+                    "page_has_spoken_before": page_has_spoken_before,
+                    "must_speak": must_speak,
                     "narration_matches": match,
                     "narration": asdict(narration),
                     "commentary_plan": (
                         {
                             **asdict(commentary_plan),
-                            "suppressed_reason": commentary_suppressed_reason,
+                            "intensity_boosted": commentary_intensity_boosted,
                             "raw_response": commentary_plan_response.text,
                             "response_id": commentary_plan_response.response_id,
                         }
@@ -1039,6 +1530,9 @@ def main(argv: list[str] | None = None) -> int:
                     encoding="utf-8",
                 )
                 last_text = text
+                if advance_marker.kind == "book":
+                    page_text_parts.clear()
+                    page_has_spoken = False
                 if turn_number < turns:
                     time.sleep(args.after_enter_delay)
 

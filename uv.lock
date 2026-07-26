@@ -16,6 +16,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ndlocr-lite" },
+    { name = "numpy" },
+    { name = "opencv-python-headless" },
     { name = "pillow" },
     { name = "sounddevice" },
     { name = "websocket-client" },
@@ -29,6 +31,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ndlocr-lite", git = "https://github.com/ndl-lab/ndlocr-lite.git?rev=7fd36cd58df7df1270ac19c7231988a77ec980ab" },
+    { name = "numpy", specifier = ">=2.0" },
+    { name = "opencv-python-headless", specifier = ">=4.8" },
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "sounddevice", specifier = ">=0.5.2" },
     { name = "websocket-client", specifier = ">=1.8.0" },

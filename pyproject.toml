@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "ndlocr-lite",
+    "numpy>=2.0",
+    "opencv-python-headless>=4.8",
     "pillow>=12.1.1",
     "sounddevice>=0.5.2",
     "websocket-client>=1.8.0",

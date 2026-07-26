@@ -1,17 +1,19 @@
 import json
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
+import game_window_ocr.commentary as commentary_module
 from game_window_ocr.cli import clean_ocr_text, parse_crop, prepare_ocr_image
 from game_window_ocr.commentary import (
     CommentaryPlan,
-    apply_commentary_cooldown,
+    apply_commentary_intensity_boost,
     build_commentary_prompt,
     build_commentary_speech_prompt,
     build_narration_prompt,
     collapse_visual_line_breaks,
     commentary_plan_issue,
+    detect_advance_marker,
     extract_incremental_text,
     narration_matches,
     parse_commentary_plan,
@@ -82,7 +84,13 @@ def test_narration_prompt_collapses_visual_line_wraps() -> None:
 
 
 def test_commentary_prompt_limits_length_and_repetition() -> None:
-    prompt = build_commentary_prompt("雪が降っていた。", turns_since_spoken=1)
+    prompt = build_commentary_prompt(
+        "雪が降っていた。",
+        page_text="山道を歩いていた。雪が降っていた。",
+        advance_marker="book",
+        page_has_spoken=False,
+        must_speak=True,
+    )
     assert '"new_game_text": "雪が降っていた。"' in prompt
     assert "silent" in prompt
     assert "reaction" in prompt
@@ -90,10 +98,112 @@ def test_commentary_prompt_limits_length_and_repetition() -> None:
     assert "最大2文・合計90文字" in prompt
     assert "毎画面しゃべる必要はありません" in prompt
     assert '"mode":"silent"' in prompt
-    assert "〜なんだよね〜" in prompt
     assert "同じ相づち・冒頭・語尾を連続させず" in prompt
-    assert "70～80%程度をsilent" in prompt
-    assert '"turns_since_spoken": 1' in prompt
+    assert "triangleではquickを使わない" in prompt
+    assert '"advance_marker": "book"' in prompt
+    assert '"must_speak": true' in prompt
+    assert "20代くらいの女性" in prompt
+    assert "短めの2～3文・合計28～90文字" in prompt
+    assert "頼りになりそうだよね" in prompt
+
+
+@pytest.mark.parametrize(
+    ("kind", "rows"),
+    [
+        ("triangle", commentary_module._TRIANGLE_MARKER_ROWS),
+        ("book", commentary_module._BOOK_MARKER_ROWS),
+    ],
+)
+def test_detect_advance_marker_from_template(
+    kind: str,
+    rows: tuple[str, ...],
+) -> None:
+    canvas = Image.new("L", (960, 540), 0)
+    template = Image.fromarray(commentary_module._marker_template(rows))
+    canvas.paste(template, (300, 200))
+    marker = detect_advance_marker(canvas.convert("RGB"))
+    assert marker.kind == kind
+    assert marker.score == pytest.approx(1.0)
+
+
+def test_detect_advance_marker_returns_none_for_blank_image() -> None:
+    marker = detect_advance_marker(Image.new("RGB", (960, 540), "black"))
+    assert marker.kind == "none"
+
+
+def test_detect_triangle_marker_on_bright_background() -> None:
+    canvas = Image.new("L", (960, 540), 180)
+    draw = ImageDraw.Draw(canvas)
+    draw.polygon([(147, 213), (169, 228), (147, 245)], fill=0)
+    draw.polygon([(150, 216), (165, 228), (150, 242)], fill=255)
+
+    marker = detect_advance_marker(canvas.convert("RGB"))
+
+    assert marker.kind == "triangle"
+    assert marker.score == pytest.approx(0.90)
+    assert marker.location is not None
+    assert abs(marker.location[0] - 150) <= 1
+    assert abs(marker.location[1] - 216) <= 1
+
+
+def test_marker_wait_retries_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    blank = Image.new("RGB", (960, 540), "black")
+    ready = Image.new("RGB", (960, 540), "white")
+    results = iter(
+        [
+            (
+                blank,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.60,
+                    (100, 100),
+                    waited_seconds=12.0,
+                ),
+            ),
+            (
+                ready,
+                commentary_module.AdvanceMarker(
+                    "triangle",
+                    0.90,
+                    (150, 216),
+                    waited_seconds=0.2,
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: next(results),
+    )
+    monkeypatch.setattr(commentary_module.time, "sleep", lambda seconds: None)
+    timestamps = iter([10.0, 22.2])
+    monkeypatch.setattr(
+        commentary_module.time,
+        "monotonic",
+        lambda: next(timestamps),
+    )
+    timeout_capture = tmp_path / "marker_timeout_latest.png"
+
+    image, marker = commentary_module.wait_for_advance_marker_with_retries(
+        object(),
+        activate=False,
+        timeout=12.0,
+        poll_interval=0.15,
+        threshold=0.78,
+        retries=0,
+        retry_delay=1.0,
+        retry_capture_path=timeout_capture,
+    )
+
+    assert image is ready
+    assert marker.kind == "triangle"
+    assert marker.retry_count == 1
+    assert marker.waited_seconds == pytest.approx(12.2)
+    assert timeout_capture.exists()
 
 
 def test_extract_incremental_text_returns_only_appended_screen_text() -> None:
@@ -188,24 +298,42 @@ def test_commentary_plan_issue_rejects_long_reaction() -> None:
     assert "上限12文字" in (commentary_plan_issue(plan) or "")
 
 
-def test_commentary_cooldown_suppresses_quick_for_two_turns() -> None:
-    plan = CommentaryPlan(
+def test_commentary_policy_requires_speech_at_unspoken_page_end() -> None:
+    silent = CommentaryPlan(
+        comment="",
+        mode="silent",
+        emotion="calm",
+        intensity=0.0,
+        pace="normal",
+    )
+    assert "silentは禁止" in (
+        commentary_plan_issue(
+            silent,
+            must_speak=True,
+            advance_marker="book",
+        )
+        or ""
+    )
+
+
+def test_commentary_policy_disallows_quick_at_triangle_marker() -> None:
+    quick = CommentaryPlan(
         comment="へぇ、そうなんだ。",
         mode="quick",
         emotion="calm",
         intensity=0.3,
         pace="normal",
     )
-    suppressed, reason = apply_commentary_cooldown(
-        plan,
-        turns_since_spoken=2,
+    assert "quickを使いません" in (
+        commentary_plan_issue(
+            quick,
+            advance_marker="triangle",
+        )
+        or ""
     )
-    assert suppressed.mode == "silent"
-    assert suppressed.comment == ""
-    assert reason == "quick_cooldown_after_2_turns"
 
 
-def test_commentary_cooldown_keeps_reaction_and_major_commentary() -> None:
+def test_commentary_policy_keeps_reaction_at_triangle_marker() -> None:
     reaction = CommentaryPlan(
         comment="うわっ！",
         mode="reaction",
@@ -213,22 +341,123 @@ def test_commentary_cooldown_keeps_reaction_and_major_commentary() -> None:
         intensity=0.8,
         pace="fast",
     )
-    assert apply_commentary_cooldown(
+    assert commentary_plan_issue(
         reaction,
-        turns_since_spoken=1,
-    ) == (reaction, None)
+        advance_marker="triangle",
+    ) is None
 
-    extended = CommentaryPlan(
-        comment="あ、これ証言と食い違ってるじゃん。アリバイが崩れたかも。",
-        mode="extended",
+
+def test_commentary_policy_accepts_two_sentence_page_comment() -> None:
+    page_comment = CommentaryPlan(
+        comment=(
+            "この子、落ち着いてて頼りになりそうだよね。"
+            "眼鏡も似合ってるし、まとめ役っぽいかも。"
+        ),
+        mode="quick",
         emotion="thoughtful",
-        intensity=0.7,
+        intensity=0.6,
         pace="normal",
     )
-    assert apply_commentary_cooldown(
-        extended,
-        turns_since_spoken=1,
-    ) == (extended, None)
+    assert commentary_plan_issue(
+        page_comment,
+        must_speak=True,
+        advance_marker="book",
+    ) is None
+
+
+def test_commentary_policy_rejects_short_page_comment() -> None:
+    short_comment = CommentaryPlan(
+        comment="頼りになりそうだよね。",
+        mode="quick",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    assert "短すぎます" in (
+        commentary_plan_issue(
+            short_comment,
+            must_speak=True,
+            advance_marker="book",
+        )
+        or ""
+    )
+
+
+def test_commentary_policy_rejects_reaction_only_at_page_end() -> None:
+    reaction = CommentaryPlan(
+        comment="うわっ！",
+        mode="reaction",
+        emotion="surprised",
+        intensity=0.9,
+        pace="fast",
+    )
+    assert "2～3文" in (
+        commentary_plan_issue(
+            reaction,
+            must_speak=True,
+            advance_marker="book",
+        )
+        or ""
+    )
+
+
+def test_commentary_policy_requires_soft_ending_at_page_end() -> None:
+    flat = CommentaryPlan(
+        comment=(
+            "この子は落ち着いていて仕事もできそうに見える。"
+            "みんなをまとめる役として期待できる。"
+        ),
+        mode="quick",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    assert "柔らかい語尾" in (
+        commentary_plan_issue(
+            flat,
+            must_speak=True,
+            advance_marker="book",
+        )
+        or ""
+    )
+
+
+def test_commentary_policy_rejects_blunt_sentence_ending() -> None:
+    blunt = CommentaryPlan(
+        comment="この子、落ち着いてて頼りになりそうだな。",
+        mode="quick",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    assert "ぶっきらぼうな語尾" in (commentary_plan_issue(blunt) or "")
+
+
+@pytest.mark.parametrize(
+    ("mode", "input_intensity", "expected_intensity"),
+    [
+        ("silent", 0.0, 0.0),
+        ("reaction", 0.3, 0.85),
+        ("quick", 0.3, 0.55),
+        ("extended", 0.3, 0.70),
+        ("reaction", 0.95, 0.95),
+    ],
+)
+def test_commentary_intensity_boost_uses_mode_floor(
+    mode: str,
+    input_intensity: float,
+    expected_intensity: float,
+) -> None:
+    plan = CommentaryPlan(
+        comment="" if mode == "silent" else "えっ、マジ!?",
+        mode=mode,
+        emotion="calm" if mode == "silent" else "surprised",
+        intensity=input_intensity,
+        pace="normal",
+    )
+    boosted, changed = apply_commentary_intensity_boost(plan)
+    assert boosted.intensity == expected_intensity
+    assert changed is (expected_intensity != input_intensity)
 
 
 def test_commentary_plan_issue_rejects_long_quick_comment() -> None:
@@ -305,8 +534,10 @@ def test_commentary_speech_prompt_uses_selected_delivery() -> None:
         )
     )
     assert '"response_text": "えっ、今の何!?"' in prompt
-    assert "本当に意外だったような驚き" in prompt
-    assert "若い成人のような、くだけた自然な声" in prompt
+    assert "思わず声が跳ねる大きな驚き" in prompt
+    assert "20代くらいの女性" in prompt
+    assert "相手へ話しかける柔らかい抑揚" in prompt
+    assert "普段の会話よりリアクションを一段大きく" in prompt
     assert "少し速め" in prompt
     assert "0.80" in prompt
 
