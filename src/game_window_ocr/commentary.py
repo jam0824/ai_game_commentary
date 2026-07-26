@@ -3416,8 +3416,35 @@ def _finalize_timed_session(
         )
 
 
+def _wait_for_commentary_start(
+    obs_window: ObsCaptureWindow,
+) -> float:
+    """Start the shared SRT/session clock, falling back if the UI is unavailable."""
+    try:
+        mark_ready = getattr(obs_window, "mark_ready", None)
+        if callable(mark_ready):
+            mark_ready()
+
+        wait_for_start = getattr(obs_window, "wait_for_start", None)
+        if callable(wait_for_start):
+            if obs_window.is_open:
+                print("準備完了。OBS録画後、ウィンドウの「開始」を押してください。")
+            started_at = float(wait_for_start())
+        else:
+            started_at = time.monotonic()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(
+            "警告: 開始ボタンを利用できないため、自動開始で続行します: "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        started_at = time.monotonic()
+
+    print("実況を開始しました（SRT 00:00:00,000）。")
+    return started_at
+
+
 def main(argv: list[str] | None = None) -> int:
-    timeline_origin = time.monotonic()
     try:
         args = _parse_args(argv)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
@@ -3560,6 +3587,7 @@ def main(argv: list[str] | None = None) -> int:
             ocr_engine = PersistentNdlOcr()
             print(f"NDLOCR初期化: {ocr_engine.initialization_seconds:.3f}秒")
         commentary_model = args.commentary_model
+        session_started_at = _wait_for_commentary_start(obs_window)
         print(f"Realtime音声へ接続: {args.model} / voice={args.voice}")
         with ExitStack() as stack:
             realtime = stack.enter_context(
@@ -3568,7 +3596,7 @@ def main(argv: list[str] | None = None) -> int:
                     model=args.model,
                     voice=args.voice,
                     timeout=args.timeout,
-                    timeline_origin=timeline_origin,
+                    timeline_origin=session_started_at,
                 )
             )
             planner: ResponsesCommentaryPlanner | None = None
@@ -3611,7 +3639,6 @@ def main(argv: list[str] | None = None) -> int:
             last_text: str | None = None
             page_text_parts: list[str] = []
             page_has_spoken = False
-            session_started_at = time.monotonic()
             session_duration_seconds = args.session_duration_minutes * 60.0
             ending_grace_seconds = args.ending_grace_minutes * 60.0
             hard_deadline = (

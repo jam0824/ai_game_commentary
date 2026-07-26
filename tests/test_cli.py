@@ -2515,14 +2515,15 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
     events: list[str] = []
     clock = 0.0
     session_start_times: list[float] = []
+    timeline_origins: list[float | None] = []
     source_text = "ここで物語が大きく動いた。"
 
     class FakeObsWindow:
         error = None
-        is_open = False
+        is_open = True
 
         def __init__(self, *, enabled: bool) -> None:
-            assert enabled is False
+            assert enabled is True
 
         def __enter__(self):
             return self
@@ -2530,12 +2531,22 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
         def __exit__(self, exc_type, exc, traceback) -> None:
             pass
 
+        def mark_ready(self) -> None:
+            events.append("ready")
+
+        def wait_for_start(self) -> float:
+            nonlocal clock
+            events.append("start_click")
+            clock = 10.0
+            return clock
+
     class FakeOcr:
         initialization_seconds = 0.0
 
     class FakeRealtimeClient:
         def __init__(self, **kwargs) -> None:
-            pass
+            self.timeline_origin = kwargs["timeline_origin"]
+            timeline_origins.append(self.timeline_origin)
 
         def __enter__(self):
             return self
@@ -2548,6 +2559,7 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
             phase = kwargs["phase"]
             events.append(phase)
             if phase == "startup":
+                assert self.timeline_origin == 10.0
                 clock = 30.0
             transcript = (
                 source_text
@@ -2682,8 +2694,6 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
     result = commentary_module.main(
         [
             "--press-enter",
-            "--no-playback",
-            "--no-obs-window",
             "--output",
             str(tmp_path / "session"),
             "--memory-dir",
@@ -2693,8 +2703,16 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
 
     assert result == 0
     assert "enter" not in events
-    assert events == ["startup", "narration", "commentary", "closing"]
-    assert session_start_times == [30.0]
+    assert events == [
+        "ready",
+        "start_click",
+        "startup",
+        "narration",
+        "commentary",
+        "closing",
+    ]
+    assert timeline_origins == [10.0]
+    assert session_start_times == [10.0]
     turn_result = json.loads(
         (tmp_path / "session" / "turn_001" / "result.json").read_text(
             encoding="utf-8"
