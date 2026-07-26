@@ -484,6 +484,46 @@ def test_clean_ocr_text_filters_low_confidence_cursor(tmp_path) -> None:
     assert clean_ocr_text(json_path, min_confidence=0.5) == "止まった。"
 
 
+@pytest.mark.parametrize("noise", ["4A", "ｱｲ"])
+def test_clean_ocr_text_strips_two_trailing_halfwidth_characters(
+    tmp_path,
+    noise: str,
+) -> None:
+    result = {
+        "contents": [
+            [
+                {
+                    "text": f"雪山へ向かったのだ{noise}",
+                    "confidence": 0.9,
+                    "isTextline": "true",
+                }
+            ]
+        ]
+    }
+    json_path = tmp_path / "capture.json"
+    json_path.write_text(json.dumps(result), encoding="utf-8")
+
+    assert clean_ocr_text(json_path, min_confidence=0.5) == "雪山へ向かったのだ"
+
+
+def test_clean_ocr_text_keeps_one_trailing_halfwidth_character(tmp_path) -> None:
+    result = {
+        "contents": [
+            [
+                {
+                    "text": "合言葉はX",
+                    "confidence": 0.9,
+                    "isTextline": "true",
+                }
+            ]
+        ]
+    }
+    json_path = tmp_path / "capture.json"
+    json_path.write_text(json.dumps(result), encoding="utf-8")
+
+    assert clean_ocr_text(json_path, min_confidence=0.5) == "合言葉はX"
+
+
 def test_narration_prompt_wraps_source_as_verbatim_json() -> None:
     prompt = build_narration_prompt("ぼくの名前は、透。")
     assert '"response_text": "ぼくの名前は、透。"' in prompt

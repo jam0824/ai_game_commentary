@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +21,10 @@ from .windows import (
 
 
 DEFAULT_TITLE = "かまいたちの夜"
+
+
+def _is_halfwidth_character(character: str) -> bool:
+    return unicodedata.east_asian_width(character) in {"H", "Na"}
 
 
 def parse_crop(value: str) -> tuple[int, int, int, int]:
@@ -180,7 +185,12 @@ def clean_ocr_text(json_path: Path, *, min_confidence: float) -> str:
                 r"\1\2",
                 lines[-1],
             )
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) >= 2 and all(
+        _is_halfwidth_character(character) for character in text[-2:]
+    ):
+        text = text[:-2].rstrip("\n")
+    return text
 
 
 def _print_windows() -> None:
