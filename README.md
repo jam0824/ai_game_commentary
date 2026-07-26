@@ -170,8 +170,9 @@ OCRが空白位置だけを変えた場合や、既読部分に少量の文字�
 `00:00:00,000` として、感想と選択肢での発話だけを
 `output\commentary_日時\subtitles\commentary.srt` に追記します。
 本文朗読と `silent` のターンは字幕に含めません。字幕本文には生成前に確定した
-感想・選択発話を使い、日本語対応のUTF-8 SRTとして保存するため、PowerDirectorや
-YouTubeへ読み込めます。`--output` を指定した場合も、そのフォルダ内の
+感想・選択発話を使い、「。」「！」「？」の後ろに文が続く場合は自動で改行します。
+日本語対応のUTF-8 SRTとして保存するため、PowerDirectorやYouTubeへ読み込めます。
+`--output` を指定した場合も、そのフォルダ内の
 `subtitles\commentary.srt` に保存します。`--no-playback` または
 `--no-obs-window` でウィンドウを表示しない場合は、準備完了時に自動開始します。
 

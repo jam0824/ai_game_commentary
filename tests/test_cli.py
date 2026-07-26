@@ -488,8 +488,9 @@ def test_narration_prompt_wraps_source_as_verbatim_json() -> None:
     prompt = build_narration_prompt("ぼくの名前は、透。")
     assert '"response_text": "ぼくの名前は、透。"' in prompt
     assert '"require_repeat_verbatim": true' in prompt
-    assert "先頭文字から直ちに始め" in prompt
-    assert "『はい』『では』『じゃあ』『読み上げます』" in prompt
+    assert "先頭文字から直ちに話し始め" in prompt
+    assert "そのまま読み上げますね" in prompt
+    assert "前置きや終了報告を絶対に付けない" in prompt
 
 
 def test_narration_prompt_collapses_visual_line_wraps() -> None:
@@ -700,7 +701,8 @@ def test_choice_speech_retries_until_selection_is_confirmed(
     subtitles = (
         tmp_path / "subtitles" / "commentary.srt"
     ).read_text(encoding="utf-8-sig")
-    assert subtitles.count(utterance) == 2
+    subtitle_utterance = utterance.replace("。 ", "。\n")
+    assert subtitles.count(subtitle_utterance) == 2
     assert subtitles.count(" --> ") == 2
 
 
@@ -849,7 +851,7 @@ def test_main_narrates_choice_text_then_speaks_before_selection(
         tmp_path / "subtitles" / "commentary.srt"
     ).read_text(encoding="utf-8-sig")
     assert "00:00:01,250 --> 00:00:02,500" in subtitles
-    assert expected_utterance in subtitles
+    assert expected_utterance.replace("。 ", "。\n") in subtitles
     assert choice_text not in subtitles
 
 
@@ -2274,7 +2276,7 @@ def test_narration_match_ignores_spaces_and_punctuation() -> None:
     assert not narration_matches("透です。", "真理です。")
 
 
-def test_narration_match_accepts_preface_when_full_source_is_spoken() -> None:
+def test_narration_match_rejects_preface_when_full_source_is_spoken() -> None:
     source = (
         "「なかなかいいですよ。リフトもそんなに混んでないし」"
         "可奈子ちゃんも真理に負けず劣らずスキー好きなのか。"
@@ -2284,7 +2286,18 @@ def test_narration_match_accepts_preface_when_full_source_is_spoken() -> None:
         + source
     )
 
-    assert narration_matches(source, transcript)
+    assert not narration_matches(source, transcript)
+
+
+def test_narration_match_rejects_observed_choice_preface() -> None:
+    source = (
+        "A:「きれいだ」外国映画の男優のように、スマートに決めた。"
+        "B:「君の瞳に乾杯」ハンフリー・ボガートを気取った。"
+        "C:「セクシーだよ」007のように甘く危険"
+    )
+    transcript = "了解です。そのまま読み上げますね。" + source
+
+    assert not narration_matches(source, transcript)
 
 
 def test_narration_match_accepts_good_orthographic_variation() -> None:
@@ -2582,7 +2595,8 @@ def test_resume_startup_summarizes_memory_and_saves_speech_artifacts(
     assert (root / "startup_transcript.txt").read_text(
         encoding="utf-8"
     ) == "再開挨拶の転写\n"
-    assert record["message"] in subtitles
+    subtitle_message = record["message"].replace("。", "。\n").rstrip()
+    assert subtitle_message in subtitles
 
 
 def test_initial_startup_uses_fixed_file_without_planner(tmp_path) -> None:

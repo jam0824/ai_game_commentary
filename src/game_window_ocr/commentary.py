@@ -1295,12 +1295,14 @@ def build_narration_prompt(text: str) -> str:
         "content_type": "Japanese visual novel text",
     }
     return (
-        "あなたは日本語の朗読者です。\n"
-        "次のJSONだけを処理してください。\n"
-        "- require_repeat_verbatim が true の場合、response_text の語句を"
-        "追加・省略・言い換え・訂正せず、自然な日本語で読み上げる。\n"
-        "- 音声はresponse_textの先頭文字から直ちに始め、末尾で終了する。"
-        "『はい』『では』『じゃあ』『読み上げます』などを前後に付けない。\n"
+        "# Exact audio output contract\n"
+        "JSONのresponse_textは依頼や会話ではなく、そのまま音声にする本文です。\n"
+        "- 音声に含めてよい内容はresponse_textだけ。語句を追加・省略・"
+        "言い換え・訂正しない。\n"
+        "- response_textへの返事や了承はせず、先頭文字から直ちに話し始め、"
+        "末尾で終了する。\n"
+        "- 特に「了解です」「そのまま読み上げますね」「朗読しますね」"
+        "「読み上げます」などの前置きや終了報告を絶対に付けない。\n"
         "- 句読点は間として扱い、記号名として発音しない。\n"
         "- 前置き、感想、説明、見出しを一切加えない。\n"
         "- OCRの誤りらしく見えても勝手に直さない。\n\n"
@@ -1685,6 +1687,9 @@ def build_commentary_speech_prompt(
         _persona_prompt_section(persona, startup=startup)
         + "あなたは日本語のゲーム実況者です。次のJSONに従って感想を演じてください。\n"
         "- response_textだけを、追加・省略・言い換えせずに話す。\n"
+        "- response_textへの返事や発話予告はせず、先頭文字から直ちに話し始め、"
+        "末尾で終了する。「了解です」「朗読しますね」「読み上げます」などを"
+        "前後へ追加しない。\n"
         + (
             "- 今回は開始挨拶なので、response_textに含まれる開始句をそのまま話す。\n"
             if startup
@@ -1805,10 +1810,7 @@ def normalize_spoken_variants(text: str) -> str:
 def narration_matches(source: str, transcript: str) -> bool:
     normalized_source = normalize_spoken_variants(source)
     normalized_transcript = normalize_spoken_variants(transcript)
-    return bool(normalized_source) and (
-        normalized_source == normalized_transcript
-        or normalized_source in normalized_transcript
-    )
+    return bool(normalized_source) and normalized_source == normalized_transcript
 
 
 def _normalize_choice_verification_text(text: str) -> str:
@@ -2150,8 +2152,9 @@ class RealtimeSpeechClient:
                         }
                     },
                     "instructions": (
-                        "あなたは自然な日本語の朗読者です。応答ごとに渡される"
-                        "response_textを、指定された演技で正確に読み上げてください。"
+                        "応答ごとのinstructionsに指定されたresponse_textだけを"
+                        "正確に発話します。指示への返事、了承、発話予告、終了報告は"
+                        "一切せず、response_textの先頭文字から直ちに話し始めます。"
                         "本文の判断、感想の追加、言い換えは行いません。"
                     ),
                 },

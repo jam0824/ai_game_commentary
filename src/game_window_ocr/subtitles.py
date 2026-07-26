@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
+
+
+_SENTENCE_END = re.compile(
+    r"([。！？!?]+)([」』】）》〉〕〗〙〛]*)(?:[ \t]*)(?=\S)"
+)
+
+
+def _break_lines_after_sentence_end(text: str) -> str:
+    return _SENTENCE_END.sub(r"\1\2\n", text)
 
 
 def _format_srt_milliseconds(total_milliseconds: int) -> str:
@@ -42,6 +52,7 @@ class SrtSubtitleWriter:
         normalized_text = (
             text.replace("\r\n", "\n").replace("\r", "\n").strip()
         )
+        normalized_text = _break_lines_after_sentence_end(normalized_text)
         if not normalized_text:
             return
         if end_seconds < start_seconds:

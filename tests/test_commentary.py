@@ -39,6 +39,26 @@ def test_narration_response_stays_out_of_band(tmp_path) -> None:
     assert response["input"] == []
 
 
+def test_realtime_session_forbids_speech_announcements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+    sent = []
+    monkeypatch.setattr(
+        commentary_module.websocket,
+        "create_connection",
+        lambda *args, **kwargs: object(),
+    )
+    client._send = sent.append  # type: ignore[method-assign]
+    client._wait_for = lambda event_type: {}  # type: ignore[method-assign]
+
+    client.__enter__()
+
+    instructions = sent[0]["session"]["instructions"]
+    assert "発話予告" in instructions
+    assert "先頭文字から直ちに" in instructions
+
+
 def test_speech_result_uses_first_audio_time_and_pcm_duration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

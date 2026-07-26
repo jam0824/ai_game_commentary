@@ -41,3 +41,29 @@ def test_empty_srt_is_created_immediately(tmp_path) -> None:
     SrtSubtitleWriter(path)
 
     assert path.read_bytes() == b"\xef\xbb\xbf"
+
+
+def test_srt_writer_breaks_lines_after_sentence_end_marks(tmp_path) -> None:
+    path = tmp_path / "commentary.srt"
+    writer = SrtSubtitleWriter(path)
+
+    writer.add_cue(
+        (
+            "トオル、かなり限界まで来てるじゃん……！"
+            "このまま二人きりは危ないかもね。\n"
+            "本当に大丈夫！？「まだ平気!」 次へ行こう?"
+        ),
+        start_seconds=0.0,
+        end_seconds=1.0,
+    )
+
+    assert path.read_text(encoding="utf-8-sig") == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "トオル、かなり限界まで来てるじゃん……！\n"
+        "このまま二人きりは危ないかもね。\n"
+        "本当に大丈夫！？\n"
+        "「まだ平気!」\n"
+        "次へ行こう?\n"
+        "\n"
+    )
