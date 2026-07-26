@@ -14,6 +14,7 @@ from game_window_ocr.commentary import (
     SpeechResult,
     TextResult,
     apply_commentary_intensity_boost,
+    apply_ocr_replacements,
     build_choice_prompt,
     build_commentary_prompt,
     build_commentary_speech_prompt,
@@ -26,6 +27,7 @@ from game_window_ocr.commentary import (
     extract_choice_options,
     extract_incremental_text,
     load_commentator_persona,
+    load_ocr_replacements,
     narration_matches,
     parse_choice_plan,
     parse_commentary_plan,
@@ -88,7 +90,8 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
         'summary_model = "gpt-5.6-terra"\n'
         'memory_dir = "memories"\n'
         'persona_file = "personas/curious-ai.md"\n'
-        'initial_intro_file = "prompts/initial.txt"\n',
+        'initial_intro_file = "prompts/initial.txt"\n'
+        'ocr_replacements_file = "config/replacements.txt"\n',
         encoding="utf-8",
     )
 
@@ -117,6 +120,9 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
     ).resolve()
     assert configured.initial_intro_file == (
         tmp_path / "prompts" / "initial.txt"
+    ).resolve()
+    assert configured.ocr_replacements_file == (
+        tmp_path / "config" / "replacements.txt"
     ).resolve()
     assert overridden.ocr_interval == pytest.approx(0.25)
     assert overridden.session_duration_minutes == pytest.approx(15.0)
@@ -166,6 +172,132 @@ def test_commentator_persona_is_loaded_as_utf8_markdown(tmp_path) -> None:
     assert load_commentator_persona(persona_path) == (
         "# 人格\n\n人間を知りたい好奇心旺盛なAIです。"
     )
+
+
+def test_ocr_replacements_are_loaded_and_applied_in_file_order(
+    tmp_path,
+) -> None:
+    replacements_path = tmp_path / "replacements.txt"
+    replacements_path.write_text(
+        "\ufeff# 人名の読み\n\n真理 = マリ\n透=トオル\nマリ=まり",
+        encoding="utf-8",
+    )
+
+    replacements = load_ocr_replacements(replacements_path)
+
+    assert replacements == [
+        ("真理", "マリ"),
+        ("透", "トオル"),
+        ("マリ", "まり"),
+    ]
+    assert apply_ocr_replacements(
+        "真理は透に尋ねた。",
+        replacements,
+    ) == "まりはトオルに尋ねた。"
+
+
+def test_invalid_ocr_replacement_lines_do_not_block_valid_replacements(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    replacements_path = tmp_path / "replacements.txt"
+    replacements_path.write_text(
+        "区切りなし\n=空の置換前\n真理=マリ\n",
+        encoding="utf-8",
+    )
+
+    replacements = load_ocr_replacements(replacements_path)
+
+    assert replacements == [("真理", "マリ")]
+    assert "不正な行を無視します" in capsys.readouterr().err
+
+
+def test_missing_ocr_replacements_falls_back_to_original_text(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    replacements = load_ocr_replacements(tmp_path / "missing.txt")
+
+    assert replacements == []
+    assert apply_ocr_replacements("真理と透", replacements) == "真理と透"
+    assert "置換せずに続行します" in capsys.readouterr().err
+
+
+def test_recognize_capture_replaces_cleaned_ocr_and_keeps_original(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class FakeOcrEngine:
+        def recognize(self, *_args, **_kwargs) -> None:
+            pass
+
+    args = commentary_module._build_parser().parse_args([])
+    args.scale = 1.0
+    args.ocr_replacements = [("真理", "マリ"), ("透", "トオル")]
+    monkeypatch.setattr(
+        commentary_module,
+        "clean_ocr_text",
+        lambda *_args, **_kwargs: "真理は透に尋ねた。",
+    )
+
+    text = commentary_module._recognize_capture(
+        Image.new("RGB", (16, 16)),
+        tmp_path,
+        args,
+        FakeOcrEngine(),
+    )
+
+    assert text == "マリはトオルに尋ねた。"
+    assert (tmp_path / "source.txt").read_text(
+        encoding="utf-8"
+    ) == "マリはトオルに尋ねた。\n"
+    assert (tmp_path / "source_ocr_original.txt").read_text(
+        encoding="utf-8"
+    ) == "真理は透に尋ねた。\n"
+
+
+def test_original_ocr_audit_save_failure_does_not_stop_replaced_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeOcrEngine:
+        def recognize(self, *_args, **_kwargs) -> None:
+            pass
+
+    args = commentary_module._build_parser().parse_args([])
+    args.scale = 1.0
+    args.ocr_replacements = [("真理", "マリ")]
+    monkeypatch.setattr(
+        commentary_module,
+        "clean_ocr_text",
+        lambda *_args, **_kwargs: "真理が来た。",
+    )
+    original_write_text = commentary_module.Path.write_text
+
+    def fail_only_audit_file(path, *write_args, **write_kwargs):
+        if path.name == "source_ocr_original.txt":
+            raise OSError("audit unavailable")
+        return original_write_text(path, *write_args, **write_kwargs)
+
+    monkeypatch.setattr(
+        commentary_module.Path,
+        "write_text",
+        fail_only_audit_file,
+    )
+
+    text = commentary_module._recognize_capture(
+        Image.new("RGB", (16, 16)),
+        tmp_path,
+        args,
+        FakeOcrEngine(),
+    )
+
+    assert text == "マリが来た。"
+    assert (tmp_path / "source.txt").read_text(
+        encoding="utf-8"
+    ) == "マリが来た。\n"
+    assert "置換後の本文で続行します" in capsys.readouterr().err
 
 
 def test_missing_commentator_persona_falls_back_without_error(

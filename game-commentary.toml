@@ -10,6 +10,8 @@ voice = "marin"
 persona_file = "commentator-persona.md"
 # 記憶がない初回・初期化時に読む固定挨拶。
 initial_intro_file = "startup-initial.txt"
+# OCR本文へ上から順に機械的に適用する「置換前=置換後」形式のUTF-8ファイル。
+ocr_replacements_file = "ocr-replacements.txt"
 # ゲームタイトル別の全体記憶。相対パスはこの設定ファイルを基準にします。
 memory_dir = "output/memory"
 

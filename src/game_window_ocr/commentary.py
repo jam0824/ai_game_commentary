@@ -69,6 +69,7 @@ STABLE_MARKER_CANDIDATE_SCORE = 0.60
 DEFAULT_CONFIG_PATH = Path("game-commentary.toml")
 DEFAULT_PERSONA_FILE = Path("commentator-persona.md")
 DEFAULT_INITIAL_INTRO_FILE = Path("startup-initial.txt")
+DEFAULT_OCR_REPLACEMENTS_FILE = Path("ocr-replacements.txt")
 COMMENTATOR_NAME = "スカイナ"
 STARTUP_GREETING = "ごきげんよう。"
 FALLBACK_INITIAL_INTRO = (
@@ -84,6 +85,7 @@ DEFAULT_CONFIG_VALUES: dict[str, str | int | float] = {
     "voice": DEFAULT_VOICE,
     "persona_file": str(DEFAULT_PERSONA_FILE),
     "initial_intro_file": str(DEFAULT_INITIAL_INTRO_FILE),
+    "ocr_replacements_file": str(DEFAULT_OCR_REPLACEMENTS_FILE),
     "memory_dir": "output/memory",
     "scale": 2.0,
     "min_confidence": 0.5,
@@ -143,6 +145,53 @@ def load_commentator_persona(path: Path) -> str:
             file=sys.stderr,
         )
     return persona
+
+
+def load_ocr_replacements(path: Path) -> list[tuple[str, str]]:
+    """Load ordered OCR text replacements without blocking game progress."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError) as exc:
+        print(
+            "警告: OCR文字列置換ファイルを読み込めません。"
+            f"置換せずに続行します: {path} ({exc})",
+            file=sys.stderr,
+        )
+        return []
+
+    replacements: list[tuple[str, str]] = []
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            print(
+                "警告: OCR文字列置換ファイルの不正な行を無視します: "
+                f"{path}:{line_number}",
+                file=sys.stderr,
+            )
+            continue
+        source, replacement = (part.strip() for part in stripped.split("=", 1))
+        if not source:
+            print(
+                "警告: OCR文字列置換ファイルの置換前文字列が空のため"
+                f"無視します: {path}:{line_number}",
+                file=sys.stderr,
+            )
+            continue
+        replacements.append((source, replacement))
+    return replacements
+
+
+def apply_ocr_replacements(
+    text: str,
+    replacements: list[tuple[str, str]] | tuple[tuple[str, str], ...],
+) -> str:
+    """Apply OCR replacements mechanically in file order."""
+    replaced = text
+    for source, replacement in replacements:
+        replaced = replaced.replace(source, replacement)
+    return replaced
 
 
 def load_initial_intro(
@@ -2243,6 +2292,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.initial_intro_file = (
             config_path.parent / args.initial_intro_file
         ).resolve()
+    if not args.ocr_replacements_file.is_absolute():
+        args.ocr_replacements_file = (
+            config_path.parent / args.ocr_replacements_file
+        ).resolve()
     if not args.memory_dir.is_absolute():
         args.memory_dir = (
             config_path.parent / args.memory_dir
@@ -2303,6 +2356,15 @@ def _build_parser(
         default=Path(str(defaults["initial_intro_file"])),
         help=(
             "記憶がない初回・初期化時に読むUTF-8の固定挨拶。"
+            "相対パスは設定ファイルのあるフォルダを基準にします。"
+        ),
+    )
+    parser.add_argument(
+        "--ocr-replacements-file",
+        type=Path,
+        default=Path(str(defaults["ocr_replacements_file"])),
+        help=(
+            "OCR本文へ機械的に適用する「置換前=置換後」形式のUTF-8ファイル。"
             "相対パスは設定ファイルのあるフォルダを基準にします。"
         ),
     )
@@ -2489,10 +2551,26 @@ def _recognize_capture(
         output_dir=turn_dir,
         viz=args.viz,
     )
-    text = clean_ocr_text(
+    original_text = clean_ocr_text(
         turn_dir / "capture.json",
         min_confidence=args.min_confidence,
     )
+    text = apply_ocr_replacements(
+        original_text,
+        getattr(args, "ocr_replacements", ()),
+    )
+    original_text_path = turn_dir / "source_ocr_original.txt"
+    try:
+        original_text_path.write_text(
+            original_text + ("\n" if original_text else ""),
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeError) as exc:
+        print(
+            "警告: 置換前のOCR本文を保存できません。"
+            f"置換後の本文で続行します: {original_text_path} ({exc})",
+            file=sys.stderr,
+        )
     (turn_dir / "source.txt").write_text(
         text + ("\n" if text else ""),
         encoding="utf-8",
@@ -3469,6 +3547,14 @@ def main(argv: list[str] | None = None) -> int:
     commentator_persona = load_commentator_persona(args.persona_file)
     if commentator_persona:
         print(f"実況者の人格設定: {args.persona_file}")
+    args.ocr_replacements = load_ocr_replacements(
+        args.ocr_replacements_file
+    )
+    if args.ocr_replacements:
+        print(
+            "OCR文字列置換: "
+            f"{args.ocr_replacements_file} ({len(args.ocr_replacements)}件)"
+        )
 
     enable_dpi_awareness()
     if args.max_turns < 0:
