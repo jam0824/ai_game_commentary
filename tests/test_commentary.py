@@ -354,6 +354,83 @@ def test_responses_planner_uses_luna_schema_and_story_history() -> None:
     ]["text"]
 
 
+def test_responses_planner_adds_confirmed_choice_to_next_history_turn() -> None:
+    client = _FakeResponsesHttpClient(
+        [
+            _responses_payload(
+                "choice-1",
+                (
+                    '{"selected_label":"B","opinion":"ここで考え直してみたい。",'
+                    '"emotion":"thoughtful","intensity":0.6,"pace":"normal"}'
+                ),
+            ),
+            _responses_payload(
+                "commentary-1",
+                (
+                    '{"mode":"silent","comment":"","emotion":"calm",'
+                    '"intensity":0.0,"pace":"normal"}'
+                ),
+            ),
+            _responses_payload(
+                "commentary-2",
+                (
+                    '{"mode":"quick","comment":"その先が気になるね。",'
+                    '"emotion":"thoughtful","intensity":0.6,"pace":"normal"}'
+                ),
+            ),
+        ]
+    )
+    planner = ResponsesCommentaryPlanner(
+        api_key="test-key",
+        model="gpt-5.6-luna",
+        timeout=1,
+        client=client,
+    )
+    plan = commentary_module.ChoicePlan(
+        selected_label="B",
+        opinion="ここで考え直してみたい。",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    option = commentary_module.ChoiceOption(
+        "B",
+        "やっぱり、もう少しよく考えてみます",
+    )
+
+    planner.generate_text(
+        phase="choice_plan",
+        instructions="選択肢を選ぶ",
+        use_conversation_history=True,
+    )
+    planner.record_confirmed_choice(plan=plan, selected_option=option)
+    planner.generate_text(
+        phase="commentary_plan",
+        instructions="選択した台詞が表示された",
+        use_conversation_history=True,
+    )
+    planner.generate_text(
+        phase="commentary_plan",
+        instructions="選択後の新しい出来事",
+        use_conversation_history=True,
+    )
+
+    confirmed_request = client.requests[1]["json"]
+    following_request = client.requests[2]["json"]
+    confirmed_text = confirmed_request["input"][0]["content"][0]["text"]
+    assert confirmed_request["previous_response_id"] == "choice-1"
+    assert "Confirmed game events since the previous response" in confirmed_text
+    assert '"event": "choice_selection_performed"' in confirmed_text
+    assert '"selected_label": "B"' in confirmed_text
+    assert "やっぱり、もう少しよく考えてみます" in confirmed_text
+    assert "実況者自身が意図して行った確定済みの選択" in confirmed_text
+    assert following_request["previous_response_id"] == "commentary-1"
+    assert (
+        "Confirmed game events since the previous response"
+        not in following_request["input"][0]["content"][0]["text"]
+    )
+
+
 def test_responses_planner_uses_choice_schema_for_choice_phase() -> None:
     client = _FakeResponsesHttpClient(
         [

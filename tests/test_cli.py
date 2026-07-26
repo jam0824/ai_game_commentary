@@ -575,6 +575,10 @@ def test_commentary_prompt_limits_length_and_repetition() -> None:
     assert "頼りになりそうだよね" in prompt
     assert "今回は開始挨拶ではない" in prompt
     assert "「ごきげんよう」" in prompt
+    assert "choice_selection_performed" in prompt
+    assert "初めて知ったように驚かない" in prompt
+    assert "選択した台詞の表示だけ" in prompt
+    assert "予想外の結果、新事実、他の人物の反応" in prompt
 
 
 def test_extract_choice_options_keeps_multiline_option_text() -> None:
@@ -820,6 +824,7 @@ def test_choice_prompt_contains_only_available_labels() -> None:
 def test_main_narrates_choice_text_then_speaks_before_selection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     events: list[str] = []
     choice_text = "A: 正直に答える\nB: 強がって答える\nC: じっくり考える"
@@ -893,6 +898,17 @@ def test_main_narrates_choice_text_then_speaks_before_selection(
                 response_id="choice-plan",
             )
 
+        def record_confirmed_choice(
+            self,
+            *,
+            plan: ChoicePlan,
+            selected_option: ChoiceOption,
+        ) -> None:
+            assert plan.selected_label == "C"
+            assert selected_option == ChoiceOption("C", "じっくり考える")
+            events.append("confirmed:C")
+            raise RuntimeError("履歴記録失敗")
+
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
     monkeypatch.setattr(
@@ -933,7 +949,13 @@ def test_main_narrates_choice_text_then_speaks_before_selection(
     )
 
     assert result == 0
-    assert events == ["narration", "plan", "choice", "select:2"]
+    assert events == [
+        "narration",
+        "plan",
+        "choice",
+        "select:2",
+        "confirmed:C",
+    ]
     summary = json.loads(
         (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
     )
@@ -943,6 +965,7 @@ def test_main_narrates_choice_text_then_speaks_before_selection(
     assert summary["selection_performed"] is True
     assert summary["choice_speech"]["started_at_seconds"] == 1.25
     assert summary["choice_speech"]["ended_at_seconds"] == 2.5
+    assert "ゲーム進行を続けます" in capsys.readouterr().err
     subtitles = (
         tmp_path / "subtitles" / "commentary.srt"
     ).read_text(encoding="utf-8-sig")
