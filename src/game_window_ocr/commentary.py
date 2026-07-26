@@ -60,6 +60,8 @@ CHOICE_SPEECH_SIMILARITY_THRESHOLD = 0.88
 MARKER_REFERENCE_SIZE = (960, 540)
 MARKER_MATCH_THRESHOLD = 0.78
 TRIANGLE_CONTOUR_SCORE = 0.90
+STABLE_OCR_REQUIRED_SAMPLES = 3
+STABLE_MARKER_CANDIDATE_SCORE = 0.60
 
 COMMENTARY_PLANNER_INSTRUCTIONS = (
     "あなたは初見プレイ中の日本語ゲーム実況プランナーです。"
@@ -246,6 +248,8 @@ class AdvanceMarker:
     location: tuple[int, int] | None
     waited_seconds: float = 0.0
     retry_count: int = 0
+    candidate_kind: str | None = None
+    fallback_reason: str | None = None
 
 
 COMMENTARY_EMOTIONS = frozenset(
@@ -399,8 +403,18 @@ def detect_advance_marker(
         return AdvanceMarker("none", 0.0, None)
     kind, score, location = max(matches, key=lambda match: match[1])
     if score < threshold:
-        return AdvanceMarker("none", score, location)
-    return AdvanceMarker(kind, score, location)
+        return AdvanceMarker(
+            "none",
+            score,
+            location,
+            candidate_kind=kind,
+        )
+    return AdvanceMarker(
+        kind,
+        score,
+        location,
+        candidate_kind=kind,
+    )
 
 
 def wait_for_advance_marker(
@@ -430,6 +444,7 @@ def wait_for_advance_marker(
                 marker.score,
                 marker.location,
                 waited_seconds=elapsed,
+                candidate_kind=marker.candidate_kind,
             )
         if elapsed >= timeout:
             return image, AdvanceMarker(
@@ -437,6 +452,7 @@ def wait_for_advance_marker(
                 best.score,
                 best.location,
                 waited_seconds=elapsed,
+                candidate_kind=best.candidate_kind,
             )
         time.sleep(poll_interval)
 
@@ -469,6 +485,8 @@ def wait_for_advance_marker_with_retries(
                 marker.location,
                 waited_seconds=time.monotonic() - total_started,
                 retry_count=retry_count,
+                candidate_kind=marker.candidate_kind,
+                fallback_reason=marker.fallback_reason,
             )
 
         retry_count += 1
@@ -531,6 +549,21 @@ def extract_choice_options(text: str) -> tuple[ChoiceOption, ...]:
     if any(not option.text for option in options):
         return ()
     return tuple(options)
+
+
+def _contains_choice_label(text: str) -> bool:
+    return any(
+        _CHOICE_LINE_PATTERN.match(
+            unicodedata.normalize("NFKC", raw_line).strip()
+        )
+        is not None
+        for raw_line in text.splitlines()
+    )
+
+
+def _normalize_ocr_stability_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(char for char in normalized if not char.isspace())
 
 
 def build_choice_prompt(options: tuple[ChoiceOption, ...]) -> str:
@@ -1780,6 +1813,8 @@ def _capture_and_ocr(
     turn_dir: Path,
     args: argparse.Namespace,
     ocr_engine: PersistentNdlOcr,
+    *,
+    previous_text: str | None = None,
 ) -> tuple[str, AdvanceMarker]:
     total_started = time.monotonic()
     retry_count = 0
@@ -1787,6 +1822,8 @@ def _capture_and_ocr(
     raw: Image.Image | None = None
     marker = AdvanceMarker("none", 0.0, None)
     text = ""
+    stable_ocr_key = ""
+    stable_ocr_samples = 0
 
     while True:
         attempt_started = time.monotonic()
@@ -1827,6 +1864,41 @@ def _capture_and_ocr(
                     marker.location,
                     waited_seconds=time.monotonic() - total_started,
                     retry_count=retry_count,
+                    candidate_kind=marker.candidate_kind,
+                )
+                break
+
+            current_ocr_key = _normalize_ocr_stability_text(text)
+            if current_ocr_key and current_ocr_key == stable_ocr_key:
+                stable_ocr_samples += 1
+            else:
+                stable_ocr_key = current_ocr_key
+                stable_ocr_samples = 1 if current_ocr_key else 0
+
+            if (
+                stable_ocr_samples >= STABLE_OCR_REQUIRED_SAMPLES
+                and extract_incremental_text(previous_text, text)
+                and not _contains_choice_label(text)
+            ):
+                fallback_kind = "stable_text"
+                if (
+                    best_marker.candidate_kind in {"triangle", "book"}
+                    and best_marker.score >= STABLE_MARKER_CANDIDATE_SCORE
+                ):
+                    fallback_kind = best_marker.candidate_kind
+                marker = AdvanceMarker(
+                    fallback_kind,
+                    best_marker.score,
+                    best_marker.location,
+                    waited_seconds=time.monotonic() - total_started,
+                    retry_count=retry_count,
+                    candidate_kind=best_marker.candidate_kind,
+                    fallback_reason="stable_ocr",
+                )
+                print(
+                    "文字送りマークは確定できませんでしたが、"
+                    f"OCR本文が{stable_ocr_samples}回連続で変化しないため、"
+                    f"{fallback_kind}として進行します。"
                 )
                 break
 
@@ -2032,6 +2104,7 @@ def main(argv: list[str] | None = None) -> int:
                         turn_dir,
                         args,
                         ocr_engine,
+                        previous_text=last_text,
                     )
                 else:
                     (turn_dir / "source.txt").write_text(

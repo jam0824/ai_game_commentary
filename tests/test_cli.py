@@ -764,6 +764,401 @@ def test_detect_triangle_marker_on_bright_background() -> None:
     assert abs(marker.location[1] - 216) <= 1
 
 
+def test_detect_advance_marker_keeps_candidate_below_threshold() -> None:
+    canvas = Image.new("L", (960, 540), 0)
+    template = Image.fromarray(
+        commentary_module._marker_template(
+            commentary_module._BOOK_MARKER_ROWS
+        )
+    )
+    canvas.paste(template, (300, 200))
+
+    marker = detect_advance_marker(
+        canvas.convert("RGB"),
+        threshold=1.01,
+    )
+
+    assert marker.kind == "none"
+    assert marker.candidate_kind == "book"
+    assert marker.score == pytest.approx(1.0)
+
+
+def test_capture_and_ocr_uses_stable_text_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    waits = iter(
+        [
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    score,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            )
+            for score in (0.68, 0.70, 0.712)
+        ]
+    )
+    recognized: list[str] = []
+    current_text = "前の本文。\n新しく表示された本文。"
+
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: next(waits),
+    )
+
+    def fake_recognize(*args, **kwargs) -> str:
+        recognized.append(current_text)
+        return current_text
+
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        fake_recognize,
+    )
+    args = commentary_module._build_parser().parse_args([])
+
+    text, marker = commentary_module._capture_and_ocr(
+        object(),
+        tmp_path,
+        args,
+        object(),
+        previous_text="前の本文。",
+    )
+
+    assert text == current_text
+    assert len(recognized) == commentary_module.STABLE_OCR_REQUIRED_SAMPLES
+    assert marker.kind == "book"
+    assert marker.score == pytest.approx(0.712)
+    assert marker.candidate_kind == "book"
+    assert marker.fallback_reason == "stable_ocr"
+
+
+def test_capture_and_ocr_requires_consecutive_stable_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    wait_calls = 0
+    texts = iter(
+        [
+            "前の本文。\n表示途中",
+            "前の本文。\n表示が完了した。",
+            "前の本文。\n表示が完了した。",
+            "前の本文。\n表示が完了した。",
+        ]
+    )
+
+    def fake_wait(*args, **kwargs):
+        nonlocal wait_calls
+        wait_calls += 1
+        return (
+            image,
+            commentary_module.AdvanceMarker(
+                "none",
+                0.40,
+                (100, 100),
+                candidate_kind="triangle",
+            ),
+        )
+
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        fake_wait,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        lambda *args, **kwargs: next(texts),
+    )
+    args = commentary_module._build_parser().parse_args([])
+
+    text, marker = commentary_module._capture_and_ocr(
+        object(),
+        tmp_path,
+        args,
+        object(),
+        previous_text="前の本文。",
+    )
+
+    assert wait_calls == 4
+    assert text == "前の本文。\n表示が完了した。"
+    assert marker.kind == "stable_text"
+    assert marker.fallback_reason == "stable_ocr"
+
+
+def test_capture_and_ocr_does_not_fallback_without_new_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    waits = iter(
+        [
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.70,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            ),
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.70,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            ),
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.70,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            ),
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "triangle",
+                    0.90,
+                    (150, 216),
+                    candidate_kind="triangle",
+                ),
+            ),
+        ]
+    )
+    recognized: list[str] = []
+    previous_text = "前の画面と同じ本文。"
+
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: next(waits),
+    )
+
+    def fake_recognize(*args, **kwargs) -> str:
+        recognized.append(previous_text)
+        return previous_text
+
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        fake_recognize,
+    )
+    args = commentary_module._build_parser().parse_args([])
+
+    text, marker = commentary_module._capture_and_ocr(
+        object(),
+        tmp_path,
+        args,
+        object(),
+        previous_text=previous_text,
+    )
+
+    assert text == previous_text
+    assert len(recognized) == 4
+    assert marker.kind == "triangle"
+    assert marker.fallback_reason is None
+
+
+def test_capture_and_ocr_does_not_fallback_on_partial_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    waits = iter(
+        [
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.70,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            ),
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.70,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            ),
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "none",
+                    0.70,
+                    (645, 213),
+                    candidate_kind="book",
+                ),
+            ),
+            (
+                image,
+                commentary_module.AdvanceMarker(
+                    "triangle",
+                    0.90,
+                    (150, 216),
+                    candidate_kind="triangle",
+                ),
+            ),
+        ]
+    )
+    recognized: list[str] = []
+    partial_choice = "A: 左へ進む"
+
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: next(waits),
+    )
+
+    def fake_recognize(*args, **kwargs) -> str:
+        recognized.append(partial_choice)
+        return partial_choice
+
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        fake_recognize,
+    )
+    args = commentary_module._build_parser().parse_args([])
+
+    text, marker = commentary_module._capture_and_ocr(
+        object(),
+        tmp_path,
+        args,
+        object(),
+    )
+
+    assert text == partial_choice
+    assert len(recognized) == 4
+    assert marker.kind == "triangle"
+    assert marker.fallback_reason is None
+
+
+def test_main_stable_text_fallback_sends_enter_once_after_narration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+    source_text = "文字表示が完了した。"
+    image = Image.new("RGB", (960, 540), "black")
+    wait_calls = 0
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeOcr:
+        initialization_seconds = 0.0
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            events.append("narration")
+            return SpeechResult(
+                phase="narration",
+                transcript=source_text,
+                audio_bytes=100,
+                response_id="narration-response",
+            )
+
+    def fake_wait(*args, **kwargs):
+        nonlocal wait_calls
+        wait_calls += 1
+        return (
+            image,
+            commentary_module.AdvanceMarker(
+                "none",
+                0.712,
+                (645, 213),
+                candidate_kind="book",
+            ),
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        fake_wait,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        lambda *args, **kwargs: source_text,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "press_enter",
+        lambda hwnd: events.append("enter"),
+    )
+
+    result = commentary_module.main(
+        [
+            "--press-enter",
+            "--max-turns",
+            "1",
+            "--narration-only",
+            "--no-playback",
+            "--no-obs-window",
+            "--output",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    assert wait_calls == commentary_module.STABLE_OCR_REQUIRED_SAMPLES
+    assert events == ["narration", "enter"]
+    summary = json.loads(
+        (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
+    )
+    assert summary["advance_marker"]["kind"] == "book"
+    assert summary["advance_marker"]["fallback_reason"] == "stable_ocr"
+    assert summary["enter_pressed"] is True
+
+
 def test_marker_wait_retries_after_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
