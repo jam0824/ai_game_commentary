@@ -150,6 +150,10 @@ def test_responses_planner_uses_luna_schema_and_story_history() -> None:
         model="gpt-5.6-luna",
         timeout=1,
         client=client,
+        prior_memory={
+            "story_summary": "以前、山荘へ向かう約束をした。",
+            "current_state": "山荘の入口。",
+        },
     )
 
     first = planner.generate_text(
@@ -181,10 +185,17 @@ def test_responses_planner_uses_luna_schema_and_story_history() -> None:
         "instructions"
     ]
     assert "最初の約束。" in first_request["input"][0]["content"][0]["text"]
+    assert "Prior commentary memory" in first_request["input"][0]["content"][0][
+        "text"
+    ]
+    assert "山荘へ向かう約束" in first_request["input"][0]["content"][0]["text"]
     assert "previous_response_id" not in first_request
     assert second_request["previous_response_id"] == "resp-1"
     assert "約束を果たした。" in second_request["input"][0]["content"][0]["text"]
     assert "最初の約束。" not in second_request["input"][0]["content"][0]["text"]
+    assert "Prior commentary memory" not in second_request["input"][0]["content"][
+        0
+    ]["text"]
 
 
 def test_responses_planner_uses_choice_schema_for_choice_phase() -> None:

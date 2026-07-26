@@ -87,7 +87,8 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
         "ending_grace_minutes = 2.5\n"
         'summary_model = "gpt-5.6-terra"\n'
         'memory_dir = "memories"\n'
-        'persona_file = "personas/curious-ai.md"\n',
+        'persona_file = "personas/curious-ai.md"\n'
+        'initial_intro_file = "prompts/initial.txt"\n',
         encoding="utf-8",
     )
 
@@ -114,6 +115,9 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
     assert configured.persona_file == (
         tmp_path / "personas" / "curious-ai.md"
     ).resolve()
+    assert configured.initial_intro_file == (
+        tmp_path / "prompts" / "initial.txt"
+    ).resolve()
     assert overridden.ocr_interval == pytest.approx(0.25)
     assert overridden.session_duration_minutes == pytest.approx(15.0)
 
@@ -125,6 +129,15 @@ def test_commentary_defaults_to_timed_unlimited_live_session() -> None:
     assert args.session_duration_minutes == pytest.approx(20.0)
     assert args.ending_grace_minutes == pytest.approx(5.0)
     assert args.summary_model == "gpt-5.6-luna"
+    assert args.initialize_memory is False
+
+
+def test_commentary_memory_can_be_initialized_from_cli() -> None:
+    args = commentary_module._build_parser().parse_args(
+        ["--initialize-memory"]
+    )
+
+    assert args.initialize_memory is True
 
 
 @pytest.mark.parametrize(
@@ -173,6 +186,35 @@ def test_invalid_utf8_commentator_persona_falls_back_without_error(
 
     assert load_commentator_persona(persona_path) == ""
     assert "既存の基本口調で続行します" in capsys.readouterr().err
+
+
+def test_initial_intro_is_loaded_from_file_with_title_placeholder(
+    tmp_path,
+) -> None:
+    intro_path = tmp_path / "intro.txt"
+    intro_path.write_text(
+        "ごきげんよう。\nスカイナです。\n今回は『{title}』です。",
+        encoding="utf-8",
+    )
+
+    assert commentary_module.load_initial_intro(
+        intro_path,
+        title="かまいたちの夜",
+    ) == "ごきげんよう。スカイナです。今回は『かまいたちの夜』です。"
+
+
+def test_initial_intro_fallback_starts_with_fixed_greeting(tmp_path) -> None:
+    errors: list[str] = []
+    message = commentary_module.load_initial_intro(
+        tmp_path / "missing.txt",
+        title="かまいたちの夜",
+        fallback_errors=errors,
+    )
+
+    assert message.startswith("ごきげんよう。")
+    assert "スカイナ" in message
+    assert "かまいたちの夜" in message
+    assert errors
 
 
 def test_default_ocr_interval_is_half_a_second() -> None:
@@ -1206,12 +1248,13 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
             pass
 
         def speak(self, **kwargs) -> SpeechResult:
-            events.append("narration")
+            phase = kwargs["phase"]
+            events.append(phase)
             return SpeechResult(
-                phase="narration",
+                phase=phase,
                 transcript="本文とは異なる転写。",
                 audio_bytes=100,
-                response_id="narration-response",
+                response_id=f"{phase}-response",
             )
 
     def fake_wait(*args, **kwargs):
@@ -1267,13 +1310,15 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
             "--no-obs-window",
             "--output",
             str(tmp_path),
+            "--memory-dir",
+            str(tmp_path / "memory"),
         ]
     )
 
     assert result == 0
     assert wait_calls == commentary_module.STABLE_OCR_REQUIRED_SAMPLES
     assert wait_timeouts == [0.5, 0.5, 0.5]
-    assert events == ["narration", "enter"]
+    assert events == ["startup", "narration", "enter"]
     summary = json.loads(
         (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
     )
@@ -1955,6 +2000,156 @@ def test_title_memory_directory_is_safe_and_title_specific(tmp_path) -> None:
     assert first != second
 
 
+def test_prior_commentary_memory_is_loaded_unless_initializing(
+    tmp_path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    title = "かまいたちの夜"
+    overall_path = (
+        commentary_module._safe_title_memory_dir(memory_dir, title)
+        / "overall.json"
+    )
+    overall_path.parent.mkdir(parents=True)
+    expected = {"schema_version": 1, "story_summary": "雪山の宿へ向かった。"}
+    overall_path.write_text(
+        json.dumps(expected, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    assert commentary_module._load_prior_commentary_memory(
+        memory_dir,
+        title,
+        initialize_memory=False,
+    ) == expected
+    assert (
+        commentary_module._load_prior_commentary_memory(
+            memory_dir,
+            title,
+            initialize_memory=True,
+        )
+        is None
+    )
+
+
+def test_resume_startup_summarizes_memory_and_saves_speech_artifacts(
+    tmp_path,
+) -> None:
+    planner_calls: list[dict] = []
+    speech_calls: list[dict] = []
+
+    class FakePlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            planner_calls.append(kwargs)
+            return TextResult(
+                text=json.dumps(
+                    {
+                        "recap": (
+                            "透たちは雪山の宿へ到着し、"
+                            "不穏な出来事の手がかりを探している。"
+                        )
+                    },
+                    ensure_ascii=False,
+                ),
+                response_id="startup-resume-response",
+            )
+
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            speech_calls.append(kwargs)
+            return SpeechResult(
+                phase="startup",
+                transcript="再開挨拶の転写",
+                audio_bytes=100,
+                response_id="startup-speech-response",
+                started_at_seconds=1.0,
+                ended_at_seconds=3.0,
+            )
+
+    root = tmp_path / "session"
+    root.mkdir()
+    subtitle_writer = commentary_module.SrtSubtitleWriter(
+        root / "subtitles" / "commentary.srt"
+    )
+    commentary_module._create_startup_message(
+        planner=FakePlanner(),
+        prior_memory={
+            "story_summary": "透たちは雪山の宿へ到着した。",
+            "current_state": "宿の中を調べている。",
+        },
+        initial_intro_file=tmp_path / "unused.txt",
+        title="かまいたちの夜",
+        realtime=FakeRealtime(),
+        subtitle_writer=subtitle_writer,
+        root=root,
+        persona="人間を知りたいAI。",
+        playback=False,
+    )
+
+    record = json.loads(
+        (root / "startup_message.json").read_text(encoding="utf-8")
+    )
+    subtitles = (
+        root / "subtitles" / "commentary.srt"
+    ).read_text(encoding="utf-8-sig")
+    assert planner_calls[0]["phase"] == "startup_resume"
+    assert planner_calls[0]["use_conversation_history"] is True
+    assert record["mode"] == "resume"
+    assert record["message"].startswith("ごきげんよう。")
+    assert "スカイナ" in record["message"]
+    assert "前回の続き" in record["message"]
+    assert "雪山の宿へ到着" in record["message"]
+    assert speech_calls[0]["phase"] == "startup"
+    assert (root / "startup_transcript.txt").read_text(
+        encoding="utf-8"
+    ) == "再開挨拶の転写\n"
+    assert record["message"] in subtitles
+
+
+def test_initial_startup_uses_fixed_file_without_planner(tmp_path) -> None:
+    intro_path = tmp_path / "intro.txt"
+    intro_path.write_text(
+        "ごきげんよう。人間を学ぶAI、スカイナです。"
+        "今回は『{title}』を遊びます。",
+        encoding="utf-8",
+    )
+    spoken_phases: list[str] = []
+
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            spoken_phases.append(kwargs["phase"])
+            return SpeechResult(
+                phase="startup",
+                transcript="固定挨拶",
+                audio_bytes=100,
+                response_id="startup-speech-response",
+            )
+
+    root = tmp_path / "session"
+    root.mkdir()
+    commentary_module._create_startup_message(
+        planner=None,
+        prior_memory=None,
+        initial_intro_file=intro_path,
+        title="かまいたちの夜",
+        realtime=FakeRealtime(),
+        subtitle_writer=commentary_module.SrtSubtitleWriter(
+            root / "subtitles" / "commentary.srt"
+        ),
+        root=root,
+        persona="",
+        playback=False,
+    )
+
+    record = json.loads(
+        (root / "startup_message.json").read_text(encoding="utf-8")
+    )
+    assert record["mode"] == "initial"
+    assert record["fallback_used"] is False
+    assert record["message"].startswith("ごきげんよう。")
+    assert "かまいたちの夜" in record["message"]
+    assert spoken_phases == ["startup"]
+
+
 def test_session_and_overall_memories_are_created_and_updated(tmp_path) -> None:
     root = tmp_path / "session"
     root.mkdir()
@@ -2025,6 +2220,153 @@ def test_session_and_overall_memories_are_created_and_updated(tmp_path) -> None:
     assert session_memory["turn_count"] == 1
     assert overall_memory["session_count"] == 2
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_initialize_memory_starts_fresh_and_backs_up_existing_overall(
+    tmp_path,
+) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    memory_dir = tmp_path / "memory"
+    title = "かまいたちの夜"
+    overall_path = (
+        commentary_module._safe_title_memory_dir(memory_dir, title)
+        / "overall.json"
+    )
+    overall_path.parent.mkdir(parents=True)
+    previous = {
+        "schema_version": 1,
+        "session_count": 7,
+        "story_summary": "読み込ませない過去の展開。",
+    }
+    overall_path.write_text(
+        json.dumps(previous, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    overall_prompts: list[str] = []
+
+    class FakePlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            if kwargs["phase"] == "session_memory":
+                payload = {
+                    "summary": "新しく実況を始めた。",
+                    "key_events": [],
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": [],
+                    "commentator_impression": "新鮮な気持ちだ。",
+                    "next_start_point": "現在の画面から再開する。",
+                }
+            else:
+                overall_prompts.append(kwargs["instructions"])
+                payload = {
+                    "story_summary": "新しい実況の展開。",
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": [],
+                    "current_state": "現在の画面。",
+                    "commentator_perspective": "初見として見ている。",
+                    "next_start_point": "現在の画面から再開する。",
+                }
+            return TextResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                response_id=f'{kwargs["phase"]}-response',
+            )
+
+    commentary_module._create_session_memories(
+        planner=FakePlanner(),
+        root=root,
+        memory_dir=memory_dir,
+        title=title,
+        summary_model="gpt-5.6-luna",
+        termination_reason="duration_breakpoint",
+        elapsed_seconds=1_205.0,
+        records=[{"turn": "turn_001", "game_text": "新しい本文"}],
+        initialize_memory=True,
+    )
+
+    updated = json.loads(overall_path.read_text(encoding="utf-8"))
+    backups = list(
+        overall_path.parent.glob("overall.before_initialize_*.json")
+    )
+    assert len(overall_prompts) == 1
+    assert "読み込ませない過去の展開" not in overall_prompts[0]
+    assert updated["session_count"] == 1
+    assert updated["initialized"] is True
+    assert updated["previous_memory_backup"] == str(backups[0])
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text(encoding="utf-8")) == previous
+
+
+def test_initialize_memory_preserves_existing_overall_if_backup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    memory_dir = tmp_path / "memory"
+    title = "かまいたちの夜"
+    overall_path = (
+        commentary_module._safe_title_memory_dir(memory_dir, title)
+        / "overall.json"
+    )
+    overall_path.parent.mkdir(parents=True)
+    previous_text = '{"schema_version":1,"session_count":7}'
+    overall_path.write_text(previous_text, encoding="utf-8")
+
+    class FakePlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            if kwargs["phase"] == "session_memory":
+                payload = {
+                    "summary": "新しく実況を始めた。",
+                    "key_events": [],
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": [],
+                    "commentator_impression": "新鮮な気持ちだ。",
+                    "next_start_point": "現在の画面から再開する。",
+                }
+            else:
+                payload = {
+                    "story_summary": "新しい実況の展開。",
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": [],
+                    "current_state": "現在の画面。",
+                    "commentator_perspective": "初見として見ている。",
+                    "next_start_point": "現在の画面から再開する。",
+                }
+            return TextResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                response_id=f'{kwargs["phase"]}-response',
+            )
+
+    monkeypatch.setattr(
+        commentary_module.shutil,
+        "copy2",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("バックアップ先へ書き込めない")
+        ),
+    )
+
+    commentary_module._create_session_memories(
+        planner=FakePlanner(),
+        root=root,
+        memory_dir=memory_dir,
+        title=title,
+        summary_model="gpt-5.6-luna",
+        termination_reason="duration_breakpoint",
+        elapsed_seconds=1_205.0,
+        records=[{"turn": "turn_001", "game_text": "新しい本文"}],
+        initialize_memory=True,
+    )
+
+    assert overall_path.read_text(encoding="utf-8") == previous_text
+    pending = json.loads(
+        (root / "overall_memory_pending.json").read_text(encoding="utf-8")
+    )
+    assert "バックアップできません" in pending["generation_errors"][0]
+    assert pending["generated_overall_memory"]["session_count"] == 1
 
 
 def test_memory_failure_saves_pending_source_without_raising(tmp_path) -> None:
@@ -2171,6 +2513,8 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
     tmp_path,
 ) -> None:
     events: list[str] = []
+    clock = 0.0
+    session_start_times: list[float] = []
     source_text = "ここで物語が大きく動いた。"
 
     class FakeObsWindow:
@@ -2200,8 +2544,11 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
             pass
 
         def speak(self, **kwargs) -> SpeechResult:
+            nonlocal clock
             phase = kwargs["phase"]
             events.append(phase)
+            if phase == "startup":
+                clock = 30.0
             transcript = (
                 source_text
                 if phase == "narration"
@@ -2286,6 +2633,11 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
             )
 
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        commentary_module.time,
+        "monotonic",
+        lambda: clock,
+    )
     monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
     monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
     monkeypatch.setattr(
@@ -2311,10 +2663,15 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
             commentary_module.AdvanceMarker("book", 1.0, None),
         ),
     )
+
+    def fake_stop_reason(**kwargs) -> str:
+        session_start_times.append(kwargs["session_started_at"])
+        return "duration_breakpoint"
+
     monkeypatch.setattr(
         commentary_module,
         "_session_stop_reason",
-        lambda **kwargs: "duration_breakpoint",
+        fake_stop_reason,
     )
     monkeypatch.setattr(
         commentary_module,
@@ -2336,7 +2693,8 @@ def test_timed_book_ending_does_not_press_enter_and_creates_memories(
 
     assert result == 0
     assert "enter" not in events
-    assert events == ["narration", "commentary", "closing"]
+    assert events == ["startup", "narration", "commentary", "closing"]
+    assert session_start_times == [30.0]
     turn_result = json.loads(
         (tmp_path / "session" / "turn_001" / "result.json").read_text(
             encoding="utf-8"
@@ -2498,7 +2856,7 @@ def test_timed_choice_ending_does_not_plan_or_perform_selection(
 
     assert result == 0
     assert selections == []
-    assert phases == ["narration", "closing"]
+    assert phases == ["startup", "narration", "closing"]
     turn_result = json.loads(
         (tmp_path / "session" / "turn_001" / "result.json").read_text(
             encoding="utf-8"
@@ -2606,7 +2964,7 @@ def test_summary_client_start_failure_still_speaks_fallback_closing(
     )
 
     assert result == 0
-    assert phases == ["narration", "closing"]
+    assert phases == ["startup", "narration", "closing"]
     closing_plan = json.loads(
         (root / "closing_plan.json").read_text(encoding="utf-8")
     )

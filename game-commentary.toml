@@ -8,6 +8,8 @@ summary_model = "gpt-5.6-luna"
 voice = "marin"
 # 実況者の設定。相対パスはこの設定ファイルの場所を基準にします。
 persona_file = "commentator-persona.md"
+# 記憶がない初回・初期化時に読む固定挨拶。
+initial_intro_file = "startup-initial.txt"
 # ゲームタイトル別の全体記憶。相対パスはこの設定ファイルを基準にします。
 memory_dir = "output/memory"
 
@@ -16,7 +18,7 @@ min_confidence = 0.5
 # 0は時間終了まで無制限。正数にすると画面数の安全上限になります。
 max_turns = 0
 # 準備完了後、この時間を過ぎたら本マークまたは選択肢で実況を締めます。
-session_duration_minutes = 20.0
+session_duration_minutes = 5.0
 # 自然な区切りが来ない場合に待つ最大時間。
 ending_grace_minutes = 5.0
 

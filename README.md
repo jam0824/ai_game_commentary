@@ -106,6 +106,18 @@ OCRの再確認間隔は `ocr_interval = 0.5` 秒です。同じ設定をコマ�
 選択肢の判断、音声の演技へ共通して反映されます。ファイルが見つからない場合や
 空の場合は警告を表示し、ゲーム進行を止めずに既存の基本口調で続行します。
 
+実況AIの名前は「スカイナ」です。時間制の実況を開始すると、ゲームを進める前に
+必ず「ごきげんよう。」から始まる挨拶を発話します。記憶がない初回、または
+`--initialize-memory` の場合は `startup-initial.txt` の固定文を読みます。
+`{title}` は現在のゲームタイトルへ置き換わります。固定文の場所は
+`initial_intro_file` または `--initial-intro-file` で変更できます。
+
+過去の記憶がある場合は、スカイナが前回の続きである旨と、これまでの展開の
+短いまとめをLunaで生成してから再開します。開始挨拶の音声、転写、生成内容は
+実行フォルダの `startup.wav`、`startup_transcript.txt`、
+`startup_message.json` に保存され、実況字幕にも追加されます。制限時間は、
+この開始挨拶の処理が終わってから計測します。
+
 朗読・感想の再生後にゲームへEnterを1回送る場合だけ、明示的に指定します。
 
 ```powershell
@@ -148,6 +160,18 @@ YouTubeへ読み込めます。`--output` を指定した場合も、そのフ�
 高評価の案内を発話し、同じ字幕へ追加します。その後、既定では
 `gpt-5.6-luna` を使って実行フォルダ直下の `session_memory.json` と、
 `output\memory\タイトル_ハッシュ\overall.json` を作成・更新します。
+通常起動では、そのタイトルの `overall.json` を最初の実況プランへ読み込み、
+前回までの物語や未解決事項を踏まえて実況します。過去の記憶を使わず新しく
+始めたい場合は `--initialize-memory` を指定してください。
+
+```powershell
+uv run game-commentary --press-enter --initialize-memory
+```
+
+この場合、過去の全体記憶はモデルへ読み込まれません。時間終了後に新しい記憶を
+正常生成できた場合だけ、旧ファイルを同じフォルダの
+`overall.before_initialize_日時.json` へバックアップしてから
+`overall.json` を新規状態（セッション数1）で置き換えます。
 要約に2回失敗した場合は元のターン記録を
 `session_memory_pending.json` または `overall_memory_pending.json` に残し、
 実況終了を無期限に待たせません。モデルと保存先は `summary_model`、
