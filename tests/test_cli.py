@@ -463,7 +463,7 @@ def test_choice_prompt_contains_only_available_labels() -> None:
     assert "人間の選択に興味津々なAI" in prompt
 
 
-def test_main_speaks_choice_before_sending_selection_keys(
+def test_main_narrates_choice_text_then_speaks_before_selection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -498,9 +498,19 @@ def test_main_speaks_choice_before_sending_selection_keys(
             pass
 
         def speak(self, **kwargs) -> SpeechResult:
-            events.append("speak")
+            phase = kwargs["phase"]
+            events.append(phase)
+            if phase == "narration":
+                return SpeechResult(
+                    phase=phase,
+                    transcript=collapse_visual_line_breaks(choice_text),
+                    audio_bytes=200,
+                    response_id="choice-narration",
+                    started_at_seconds=0.25,
+                    ended_at_seconds=1.0,
+                )
             return SpeechResult(
-                phase="choice",
+                phase=phase,
                 transcript=expected_utterance,
                 audio_bytes=100,
                 response_id="choice-speech",
@@ -569,10 +579,12 @@ def test_main_speaks_choice_before_sending_selection_keys(
     )
 
     assert result == 0
-    assert events == ["plan", "speak", "select:2"]
+    assert events == ["narration", "plan", "choice", "select:2"]
     summary = json.loads(
         (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
     )
+    assert summary["narration_matches"] is True
+    assert summary["narration"]["response_id"] == "choice-narration"
     assert summary["choice_plan"]["selected_label"] == "C"
     assert summary["selection_performed"] is True
     assert summary["choice_speech"]["started_at_seconds"] == 1.25

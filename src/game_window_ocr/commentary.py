@@ -2331,9 +2331,57 @@ def main(argv: list[str] | None = None) -> int:
                         waited_seconds=advance_marker.waited_seconds,
                         retry_count=advance_marker.retry_count,
                     )
+                    turn_text = extract_incremental_text(last_text, text)
+                    if not turn_text:
+                        turn_text = collapse_visual_line_breaks(text)
+                        print(
+                            "警告: 選択肢画面の追加本文を特定できなかったため、"
+                            "画面内の文章全体を朗読します。",
+                            file=sys.stderr,
+                        )
                     print(f"\n[{turn_number}/{turns}] 選択肢:")
                     for option in choices:
                         print(f"{option.label}: {option.text}")
+                    narration: SpeechResult | None = None
+                    narration_error: str | None = None
+                    match: bool | None = None
+                    print("選択肢画面の文章を朗読しています...")
+                    try:
+                        narration = realtime.speak(
+                            phase="narration",
+                            instructions=build_narration_prompt(turn_text),
+                            wav_path=turn_dir / "narration.wav",
+                            playback=not args.no_playback,
+                        )
+                        (turn_dir / "narration_transcript.txt").write_text(
+                            narration.transcript + "\n",
+                            encoding="utf-8",
+                        )
+                        match = narration_matches(
+                            turn_text,
+                            narration.transcript,
+                        )
+                        print(f"朗読転写: {narration.transcript}")
+                        print(
+                            "本文一致（空白・句読点を除外）: "
+                            f"{'OK' if match else '要確認'}"
+                        )
+                    except (
+                        OSError,
+                        RuntimeError,
+                        websocket.WebSocketException,
+                    ) as exc:
+                        narration_error = str(exc)
+                        (turn_dir / "narration_error.txt").write_text(
+                            narration_error + "\n",
+                            encoding="utf-8",
+                        )
+                        print(
+                            "警告: 選択肢画面の朗読に失敗しましたが、"
+                            "ゲーム進行を止めず選択処理を続けます: "
+                            f"{narration_error}",
+                            file=sys.stderr,
+                        )
                     if args.narration_only:
                         raise RuntimeError(
                             "選択肢を検出しましたが、--narration-only では"
@@ -2469,9 +2517,14 @@ def main(argv: list[str] | None = None) -> int:
                         "voice": args.voice,
                         "persona_file": str(args.persona_file),
                         "source_text": text,
-                        "turn_text": collapse_visual_line_breaks(text),
+                        "turn_text": turn_text,
                         "page_text": "".join(page_text_parts),
                         "advance_marker": asdict(advance_marker),
+                        "narration_matches": match,
+                        "narration": (
+                            asdict(narration) if narration is not None else None
+                        ),
+                        "narration_error": narration_error,
                         "choice_options": [
                             asdict(option) for option in choices
                         ],
