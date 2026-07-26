@@ -513,6 +513,7 @@ def test_commentary_prompt_limits_length_and_repetition() -> None:
     assert '"new_game_text": "雪が降っていた。"' in prompt
     assert "silent" in prompt
     assert "reaction" in prompt
+    assert "1～20文字" in prompt
     assert "8～35文字" in prompt
     assert "最大2文・合計90文字" in prompt
     assert "毎画面しゃべる必要はありません" in prompt
@@ -1995,15 +1996,24 @@ def test_parse_commentary_plan_normalizes_silent_delivery() -> None:
     assert commentary_plan_issue(plan) is None
 
 
-def test_commentary_plan_issue_rejects_long_reaction() -> None:
-    plan = CommentaryPlan(
+def test_commentary_plan_issue_enforces_reaction_length_boundary() -> None:
+    allowed_plan = CommentaryPlan(
+        comment="えっ、ちょっと待って今のはいったい何なの",
+        mode="reaction",
+        emotion="surprised",
+        intensity=0.8,
+        pace="fast",
+    )
+    long_plan = CommentaryPlan(
         comment="えっ、ちょっと待って今のはいったい何なの!?",
         mode="reaction",
         emotion="surprised",
         intensity=0.8,
         pace="fast",
     )
-    assert "上限12文字" in (commentary_plan_issue(plan) or "")
+    assert len(allowed_plan.comment) == 20
+    assert commentary_plan_issue(allowed_plan) is None
+    assert "上限20文字" in (commentary_plan_issue(long_plan) or "")
 
 
 def test_commentary_policy_requires_speech_at_unspoken_page_end() -> None:

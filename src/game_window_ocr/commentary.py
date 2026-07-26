@@ -1337,7 +1337,7 @@ def build_commentary_prompt(
         "- silent: 反応するほどではない情景、つなぎ、既出情報、静かな説明。"
         "commentは空文字。迷ったらこれ。\n"
         "- reaction: 驚き、恐怖、笑い、成功などへ反射的に声が出る場面。"
-        "1～12文字の『うわっ！』『えっ、待って！』『よし！』のような反応だけ。\n"
+        "1～20文字の『うわっ！』『えっ、待って！』『よし！』のような反応だけ。\n"
         "- quick: 小さな新事実、人物らしさ、軽い疑問やツッコミ。"
         "通常は8～35文字の自然な1文。bookでは後述のページ末ルールを優先する。\n"
         "- extended: 事件の急展開、決定的な証拠、重大な選択、伏線回収、"
@@ -1550,7 +1550,7 @@ def commentary_plan_issue(
             return "ページ終端の感想に、友達へ話しかける柔らかい語尾がありません"
     else:
         if plan.mode == "reaction":
-            limit = 12
+            limit = 20
         elif plan.mode == "quick":
             limit = 35
         else:
