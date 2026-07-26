@@ -12,10 +12,32 @@ _SENTENCE_END = re.compile(
 _WHITESPACE_BETWEEN_EXCLAMATION_AND_QUESTION = re.compile(
     r"(?<=[！!])[ \t\n]+(?=[？?])|(?<=[？?])[ \t\n]+(?=[！!])"
 )
+_MAX_SUBTITLE_LINE_CHARACTERS = 32
 
 
 def _break_lines_after_sentence_end(text: str) -> str:
     return _SENTENCE_END.sub(r"\1\2\n", text)
+
+
+def _wrap_long_subtitle_lines(text: str) -> str:
+    wrapped_lines: list[str] = []
+    for line in text.split("\n"):
+        line_count = max(
+            1,
+            math.ceil(len(line) / _MAX_SUBTITLE_LINE_CHARACTERS),
+        )
+        characters_per_line, longer_line_count = divmod(
+            len(line),
+            line_count,
+        )
+        offset = 0
+        for line_index in range(line_count):
+            chunk_length = characters_per_line + (
+                line_index < longer_line_count
+            )
+            wrapped_lines.append(line[offset : offset + chunk_length])
+            offset += chunk_length
+    return "\n".join(wrapped_lines)
 
 
 def _normalize_subtitle_text(text: str) -> str:
@@ -25,7 +47,8 @@ def _normalize_subtitle_text(text: str) -> str:
     normalized_text = _WHITESPACE_BETWEEN_EXCLAMATION_AND_QUESTION.sub(
         "", normalized_text
     )
-    return _break_lines_after_sentence_end(normalized_text)
+    sentence_broken_text = _break_lines_after_sentence_end(normalized_text)
+    return _wrap_long_subtitle_lines(sentence_broken_text)
 
 
 def _non_whitespace_length(text: str) -> int:

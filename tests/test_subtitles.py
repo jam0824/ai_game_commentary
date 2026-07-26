@@ -93,6 +93,46 @@ def test_srt_writer_does_not_break_between_exclamation_and_question(
     )
 
 
+def test_srt_writer_wraps_sentences_of_33_characters_or_more(
+    tmp_path,
+) -> None:
+    path = tmp_path / "commentary.srt"
+    writer = SrtSubtitleWriter(path)
+
+    writer.add_cue(
+        f"{'あ' * 32}。{'い' * 32}",
+        start_seconds=0.0,
+        end_seconds=1.0,
+    )
+
+    assert path.read_text(encoding="utf-8-sig") == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        f"{'あ' * 17}\n"
+        f"{'あ' * 15}。\n"
+        f"{'い' * 32}\n"
+        "\n"
+    )
+
+
+def test_srt_writer_balances_multiple_wrapped_lines(tmp_path) -> None:
+    path = tmp_path / "commentary.srt"
+    writer = SrtSubtitleWriter(path)
+
+    writer.add_cue(
+        "あ" * 65,
+        start_seconds=0.0,
+        end_seconds=1.0,
+    )
+
+    assert path.read_text(encoding="utf-8-sig").splitlines()[2:] == [
+        "あ" * 22,
+        "あ" * 22,
+        "あ" * 21,
+        "",
+    ]
+
+
 def test_srt_writer_groups_lines_and_distributes_time_by_text_length(
     tmp_path,
 ) -> None:
