@@ -128,6 +128,7 @@ def test_commentary_defaults_to_timed_unlimited_live_session() -> None:
     assert args.max_turns == 0
     assert args.session_duration_minutes == pytest.approx(20.0)
     assert args.ending_grace_minutes == pytest.approx(5.0)
+    assert args.unchanged_screen_retries == 3
     assert args.summary_model == "gpt-5.6-luna"
     assert args.initialize_memory is False
 
@@ -1327,6 +1328,278 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
     assert summary["narration_matches"] is False
     assert summary["enter_pressed"] is True
     assert summary["enter_blocked_reason"] is None
+
+
+def test_main_resends_enter_without_repeating_speech_for_unchanged_screen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+    captured_texts = iter(
+        [
+            "最初の本文。",
+            "最初の本文。",
+            "次の本文。",
+        ]
+    )
+    narration_transcripts = iter(["最初の本文。", "次の本文。"])
+    image = Image.new("RGB", (960, 540), "black")
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeOcr:
+        initialization_seconds = 0.0
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            phase = kwargs["phase"]
+            events.append(phase)
+            transcript = (
+                next(narration_transcripts)
+                if phase == "narration"
+                else "開始します。"
+            )
+            return SpeechResult(
+                phase=phase,
+                transcript=transcript,
+                audio_bytes=100,
+                response_id=f"{phase}-response",
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: (
+            image,
+            commentary_module.AdvanceMarker(
+                "book",
+                0.90,
+                (377, 258),
+                candidate_kind="book",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        lambda *args, **kwargs: next(captured_texts),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "press_enter",
+        lambda hwnd: events.append("enter"),
+    )
+
+    result = commentary_module.main(
+        [
+            "--press-enter",
+            "--max-turns",
+            "2",
+            "--narration-only",
+            "--no-playback",
+            "--no-obs-window",
+            "--after-enter-delay",
+            "0",
+            "--output",
+            str(tmp_path),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+        ]
+    )
+
+    assert result == 0
+    assert events == [
+        "startup",
+        "narration",
+        "enter",
+        "enter",
+        "narration",
+        "enter",
+    ]
+    recovery = json.loads(
+        (
+            tmp_path
+            / "turn_002"
+            / "unchanged_screen_recovery_001.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert recovery["enter_pressed"] is True
+    second_summary = json.loads(
+        (tmp_path / "turn_002" / "result.json").read_text(encoding="utf-8")
+    )
+    assert second_summary["source_text"] == "次の本文。"
+    assert second_summary["unchanged_screen_retries"] == 1
+    assert second_summary["enter_pressed"] is True
+
+
+def test_main_stops_automatic_input_after_unchanged_retry_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+    captured_texts = iter(["最初の本文。", "最初の本文。"])
+    image = Image.new("RGB", (960, 540), "black")
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeOcr:
+        initialization_seconds = 0.0
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            phase = kwargs["phase"]
+            events.append(phase)
+            return SpeechResult(
+                phase=phase,
+                transcript=(
+                    "最初の本文。"
+                    if phase == "narration"
+                    else "開始します。"
+                ),
+                audio_bytes=100,
+                response_id=f"{phase}-response",
+            )
+
+    class FakeSummaryPlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FakeSummaryPlanner,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_finalize_timed_session",
+        lambda **kwargs: events.append("finalize"),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: (
+            image,
+            commentary_module.AdvanceMarker(
+                "book",
+                0.90,
+                (377, 258),
+                candidate_kind="book",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        lambda *args, **kwargs: next(captured_texts),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "press_enter",
+        lambda hwnd: events.append("enter"),
+    )
+
+    result = commentary_module.main(
+        [
+            "--press-enter",
+            "--max-turns",
+            "2",
+            "--narration-only",
+            "--no-playback",
+            "--no-obs-window",
+            "--after-enter-delay",
+            "0",
+            "--unchanged-screen-retries",
+            "0",
+            "--output",
+            str(tmp_path),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+        ]
+    )
+
+    assert result == 0
+    assert events == ["startup", "narration", "enter", "finalize"]
+    stopped_summary = json.loads(
+        (tmp_path / "turn_002" / "result.json").read_text(encoding="utf-8")
+    )
+    assert stopped_summary["enter_pressed"] is False
+    assert (
+        stopped_summary["enter_blocked_reason"]
+        == "unchanged_screen_recovery_exhausted"
+    )
+    assert len(commentary_module._collect_session_records(tmp_path)) == 1
 
 
 def test_marker_wait_retries_after_timeout(

@@ -25,6 +25,8 @@ ending_grace_minutes = 5.0
 speech_retries = 0
 speech_retry_delay = 0.5
 after_enter_delay = 1.0
+# Enter後も同じ本文なら、重複朗読せず同じウィンドウへ再送する上限。
+unchanged_screen_retries = 3
 
 # 文字送りマークが見つからない間にOCRを再確認する間隔。
 ocr_interval = 0.5

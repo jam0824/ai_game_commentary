@@ -93,6 +93,7 @@ DEFAULT_CONFIG_VALUES: dict[str, str | int | float] = {
     "speech_retries": 0,
     "speech_retry_delay": 0.5,
     "after_enter_delay": 1.0,
+    "unchanged_screen_retries": 3,
     "ocr_interval": OCR_INTERVAL,
     "stable_ocr_samples": STABLE_OCR_REQUIRED_SAMPLES,
     "stable_marker_candidate_score": STABLE_MARKER_CANDIDATE_SCORE,
@@ -2404,6 +2405,15 @@ def _build_parser(
         help="Enter送信後、次のキャプチャまで待つ秒数。",
     )
     parser.add_argument(
+        "--unchanged-screen-retries",
+        type=int,
+        default=defaults["unchanged_screen_retries"],
+        help=(
+            "Enter送信後も本文が変わらない場合に、同じ画面へEnterを"
+            "再送する最大回数。"
+        ),
+    )
+    parser.add_argument(
         "--ocr-interval",
         type=float,
         default=defaults["ocr_interval"],
@@ -2833,6 +2843,11 @@ def _collect_session_records(root: Path) -> list[dict[str, Any]]:
             )
             continue
         if not isinstance(result, dict):
+            continue
+        if (
+            result.get("enter_blocked_reason")
+            == "unchanged_screen_recovery_exhausted"
+        ):
             continue
         advance_marker = result.get("advance_marker")
         commentary_plan = result.get("commentary_plan")
@@ -3477,6 +3492,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.after_enter_delay < 0:
         print("エラー: --after-enter-delay は0以上にしてください。", file=sys.stderr)
         return 2
+    if args.unchanged_screen_retries < 0:
+        print(
+            "エラー: --unchanged-screen-retries は0以上にしてください。",
+            file=sys.stderr,
+        )
+        return 2
     if args.marker_timeout <= 0:
         print("エラー: --marker-timeout は0より大きくしてください。", file=sys.stderr)
         return 2
@@ -3659,90 +3680,109 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 turn_dir = root / f"turn_{turn_number:03d}"
                 turn_dir.mkdir(parents=True, exist_ok=True)
-                text = fixed_text
-                advance_marker = AdvanceMarker("unknown", 0.0, None)
-                if text is None:
-                    if window is None or ocr_engine is None:
-                        raise RuntimeError("対象ウィンドウがありません。")
-                    capture_deadline = hard_deadline
-                    if capture_deadline is None:
-                        bounded_retries = max(0, args.marker_retries)
-                        capture_deadline = time.monotonic() + (
-                            args.marker_timeout * (bounded_retries + 1)
-                            + args.marker_retry_delay * bounded_retries
+                unchanged_screen_retries = 0
+                end_session_during_capture = False
+                while True:
+                    text = fixed_text
+                    advance_marker = AdvanceMarker("unknown", 0.0, None)
+                    if text is None:
+                        if window is None or ocr_engine is None:
+                            raise RuntimeError("対象ウィンドウがありません。")
+                        capture_deadline = hard_deadline
+                        if capture_deadline is None:
+                            bounded_retries = max(0, args.marker_retries)
+                            capture_deadline = time.monotonic() + (
+                                args.marker_timeout * (bounded_retries + 1)
+                                + args.marker_retry_delay * bounded_retries
+                            )
+                        text, advance_marker = _capture_and_ocr(
+                            window,
+                            turn_dir,
+                            args,
+                            ocr_engine,
+                            previous_text=last_text,
+                            hard_deadline=capture_deadline,
+                            deadline_fallback_reason=(
+                                "session_grace_elapsed"
+                                if live_timed_session
+                                else "capture_deadline_elapsed"
+                            ),
                         )
-                    text, advance_marker = _capture_and_ocr(
-                        window,
-                        turn_dir,
-                        args,
-                        ocr_engine,
-                        previous_text=last_text,
-                        hard_deadline=capture_deadline,
-                        deadline_fallback_reason=(
-                            "session_grace_elapsed"
-                            if live_timed_session
-                            else "capture_deadline_elapsed"
-                        ),
-                    )
-                else:
-                    (turn_dir / "source.txt").write_text(
-                        text + "\n",
-                        encoding="utf-8",
-                    )
+                    else:
+                        (turn_dir / "source.txt").write_text(
+                            text + "\n",
+                            encoding="utf-8",
+                        )
 
-                if not text:
+                    if not text:
+                        if (
+                            advance_marker.fallback_reason
+                            in {
+                                "session_grace_elapsed",
+                                "capture_deadline_elapsed",
+                            }
+                        ):
+                            print(
+                                "取得期限を超えた時点のOCR本文が空だったため、"
+                                "キー入力せず処理を終了します。"
+                            )
+                            forced_end_reason = (
+                                "duration_grace_elapsed"
+                                if live_timed_session
+                                else "capture_deadline_elapsed"
+                            )
+                            if live_timed_session:
+                                termination_reason = forced_end_reason
+                            _write_json_atomic(
+                                turn_dir / "result.json",
+                                {
+                                    "model": args.model,
+                                    "commentary_model": commentary_model,
+                                    "commentary_api": "responses",
+                                    "voice": args.voice,
+                                    "persona_file": str(args.persona_file),
+                                    "source_text": "",
+                                    "turn_text": "",
+                                    "advance_marker": asdict(advance_marker),
+                                    "narration": None,
+                                    "commentary_plan": None,
+                                    "commentary": None,
+                                    "enter_pressed": False,
+                                    "enter_blocked_reason": "session_ending",
+                                    "session_termination_reason": (
+                                        forced_end_reason
+                                    ),
+                                },
+                            )
+                            end_session_during_capture = True
+                            break
+                        raise RuntimeError(
+                            "OCR本文が空です。Enterは送りません。"
+                        )
+                    if last_text != text:
+                        break
+                    duplicate_stop_reason = (
+                        _session_stop_reason(
+                            now=time.monotonic(),
+                            session_started_at=session_started_at,
+                            duration_seconds=session_duration_seconds,
+                            grace_seconds=ending_grace_seconds,
+                            marker_kind=advance_marker.kind,
+                        )
+                        if live_timed_session
+                        else None
+                    )
                     if (
                         advance_marker.fallback_reason
-                        in {
-                            "session_grace_elapsed",
-                            "capture_deadline_elapsed",
-                        }
-                    ):
-                        print(
-                            "取得期限を超えた時点のOCR本文が空だったため、"
-                            "キー入力せず処理を終了します。"
-                        )
-                        forced_end_reason = (
-                            "duration_grace_elapsed"
-                            if live_timed_session
-                            else "capture_deadline_elapsed"
-                        )
-                        if live_timed_session:
-                            termination_reason = forced_end_reason
-                        _write_json_atomic(
-                            turn_dir / "result.json",
-                            {
-                                "model": args.model,
-                                "commentary_model": commentary_model,
-                                "commentary_api": "responses",
-                                "voice": args.voice,
-                                "persona_file": str(args.persona_file),
-                                "source_text": "",
-                                "turn_text": "",
-                                "advance_marker": asdict(advance_marker),
-                                "narration": None,
-                                "commentary_plan": None,
-                                "commentary": None,
-                                "enter_pressed": False,
-                                "enter_blocked_reason": "session_ending",
-                                "session_termination_reason": (
-                                    forced_end_reason
-                                ),
-                            },
-                        )
-                        break
-                    raise RuntimeError("OCR本文が空です。Enterは送りません。")
-                if last_text == text:
-                    if (
-                        live_timed_session
-                        and advance_marker.fallback_reason
                         == "session_grace_elapsed"
                     ):
+                        duplicate_stop_reason = "duration_grace_elapsed"
+                    if duplicate_stop_reason is not None:
                         print(
-                            "終了猶予を超え、画面も直前から変化していないため、"
-                            "キー入力せず実況を締めます。"
+                            "実況終了の区切りに到達し、画面も直前から"
+                            "変化していないため、キー入力せず実況を締めます。"
                         )
-                        termination_reason = "duration_grace_elapsed"
+                        termination_reason = duplicate_stop_reason
                         _write_json_atomic(
                             turn_dir / "result.json",
                             {
@@ -3764,8 +3804,98 @@ def main(argv: list[str] | None = None) -> int:
                                 ),
                             },
                         )
+                        end_session_during_capture = True
                         break
-                    raise RuntimeError("前の画面と同じ本文です。Enterは送りません。")
+
+                    unchanged_screen_retries += 1
+                    recovery_record = {
+                        "source_text": text,
+                        "advance_marker": asdict(advance_marker),
+                        "attempt": unchanged_screen_retries,
+                        "maximum_attempts": args.unchanged_screen_retries,
+                        "enter_pressed": False,
+                    }
+                    if (
+                        unchanged_screen_retries
+                        > args.unchanged_screen_retries
+                    ):
+                        termination_reason = (
+                            "unchanged_screen_recovery_exhausted"
+                        )
+                        recovery_record["stop_reason"] = termination_reason
+                        _write_json_atomic(
+                            turn_dir
+                            / (
+                                "unchanged_screen_recovery_"
+                                f"{unchanged_screen_retries:03d}.json"
+                            ),
+                            recovery_record,
+                        )
+                        _write_json_atomic(
+                            turn_dir / "result.json",
+                            {
+                                "model": args.model,
+                                "commentary_model": commentary_model,
+                                "commentary_api": "responses",
+                                "voice": args.voice,
+                                "persona_file": str(args.persona_file),
+                                "source_text": text,
+                                "turn_text": "",
+                                "advance_marker": asdict(advance_marker),
+                                "narration": None,
+                                "commentary_plan": None,
+                                "commentary": None,
+                                "unchanged_screen_retries": (
+                                    args.unchanged_screen_retries
+                                ),
+                                "enter_pressed": False,
+                                "enter_blocked_reason": (
+                                    "unchanged_screen_recovery_exhausted"
+                                ),
+                                "session_termination_reason": (
+                                    termination_reason
+                                ),
+                            },
+                        )
+                        print(
+                            "警告: Enterを再送しても画面が変化しません。"
+                            "意図しない連打を避けるため、自動入力を安全に"
+                            "終了します。",
+                            file=sys.stderr,
+                        )
+                        end_session_during_capture = True
+                        break
+
+                    if window is None:
+                        raise RuntimeError(
+                            "Enterの再送先ウィンドウがありません。"
+                        )
+                    print(
+                        "警告: Enter送信後も前の画面と同じ本文です。"
+                        "重複した朗読・感想は行わず、同じゲーム画面へ"
+                        "Enterを再送します"
+                        f"（{unchanged_screen_retries}/"
+                        f"{args.unchanged_screen_retries}）。",
+                        file=sys.stderr,
+                    )
+                    press_enter(window.hwnd)
+                    recovery_record["enter_pressed"] = True
+                    _write_json_atomic(
+                        turn_dir
+                        / (
+                            "unchanged_screen_recovery_"
+                            f"{unchanged_screen_retries:03d}.json"
+                        ),
+                        recovery_record,
+                    )
+                    print("ゲームへEnterを再送しました。")
+                    _sleep_with_deadline(
+                        args.after_enter_delay,
+                        hard_deadline,
+                    )
+
+                if end_session_during_capture:
+                    break
 
                 choices = extract_choice_options(text)
                 if choices:
@@ -4389,6 +4519,7 @@ def main(argv: list[str] | None = None) -> int:
                         else None
                     ),
                     "commentary": asdict(commentary) if commentary else None,
+                    "unchanged_screen_retries": unchanged_screen_retries,
                     "enter_pressed": False,
                     "enter_blocked_reason": (
                         "session_ending" if stop_reason is not None else None

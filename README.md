@@ -99,6 +99,11 @@ OCRの再確認間隔は `ocr_interval = 0.5` 秒です。同じ設定をコマ�
 従来どおり処理画面数の安全上限になります。固定テキスト試験と
 `--press-enter` なしの実行は1回だけ処理します。
 
+Enter送信後も直前と同じ本文・進行マークが残っている場合は、重複した
+朗読や感想を行わず、同じゲームウィンドウへEnterを再送します。既定では
+3回まで再送し、それでも変化しない場合は意図しない連打を避けて自動入力を
+安全に終了します。上限は `--unchanged-screen-retries` で変更できます。
+
 実況者の人格は `commentator-persona.md` に分離しています。
 `game-commentary.toml` の `persona_file`、またはコマンドラインの
 `--persona-file` で別のUTF-8テキスト／Markdownを指定できます。相対パスは
