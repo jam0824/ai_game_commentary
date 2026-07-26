@@ -5,6 +5,8 @@ title = "かまいたちの夜"
 model = "gpt-realtime-2.1-mini"
 commentary_model = "gpt-5.6-luna"
 voice = "marin"
+# 実況者の設定。相対パスはこの設定ファイルの場所を基準にします。
+persona_file = "commentator-persona.md"
 
 scale = 2.0
 min_confidence = 0.5

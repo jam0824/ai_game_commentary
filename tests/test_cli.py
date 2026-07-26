@@ -25,6 +25,7 @@ from game_window_ocr.commentary import (
     detect_advance_marker,
     extract_choice_options,
     extract_incremental_text,
+    load_commentator_persona,
     narration_matches,
     parse_choice_plan,
     parse_commentary_plan,
@@ -81,7 +82,8 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
     config_path = tmp_path / "commentary.toml"
     config_path.write_text(
         "ocr_interval = 0.75\n"
-        "stable_ocr_samples = 4\n",
+        "stable_ocr_samples = 4\n"
+        'persona_file = "personas/curious-ai.md"\n',
         encoding="utf-8",
     )
 
@@ -99,7 +101,43 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
 
     assert configured.ocr_interval == pytest.approx(0.75)
     assert configured.stable_ocr_samples == 4
+    assert configured.persona_file == (
+        tmp_path / "personas" / "curious-ai.md"
+    ).resolve()
     assert overridden.ocr_interval == pytest.approx(0.25)
+
+
+def test_commentator_persona_is_loaded_as_utf8_markdown(tmp_path) -> None:
+    persona_path = tmp_path / "persona.md"
+    persona_path.write_text(
+        "\ufeff# 人格\n\n人間を知りたい好奇心旺盛なAIです。\n",
+        encoding="utf-8",
+    )
+
+    assert load_commentator_persona(persona_path) == (
+        "# 人格\n\n人間を知りたい好奇心旺盛なAIです。"
+    )
+
+
+def test_missing_commentator_persona_falls_back_without_error(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_path = tmp_path / "missing.md"
+
+    assert load_commentator_persona(missing_path) == ""
+    assert "既存の基本口調で続行します" in capsys.readouterr().err
+
+
+def test_invalid_utf8_commentator_persona_falls_back_without_error(
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    persona_path = tmp_path / "broken.md"
+    persona_path.write_bytes(b"\x81")
+
+    assert load_commentator_persona(persona_path) == ""
+    assert "既存の基本口調で続行します" in capsys.readouterr().err
 
 
 def test_default_ocr_interval_is_half_a_second() -> None:
@@ -211,6 +249,7 @@ def test_narration_prompt_collapses_visual_line_wraps() -> None:
 def test_commentary_prompt_limits_length_and_repetition() -> None:
     prompt = build_commentary_prompt(
         "雪が降っていた。",
+        persona="人間を知りたいAI。20代くらいの女性の声で話す。",
         page_text="山道を歩いていた。雪が降っていた。",
         advance_marker="book",
         page_has_spoken=False,
@@ -414,12 +453,14 @@ def test_choice_prompt_contains_only_available_labels() -> None:
         (
             ChoiceOption("A", "一つ目"),
             ChoiceOption("B", "二つ目"),
-        )
+        ),
+        persona="人間の選択に興味津々なAI。",
     )
     assert "A, B" in prompt
     assert '"label": "A"' in prompt
     assert '"label": "B"' in prompt
     assert "選択宣言はプログラムが" in prompt
+    assert "人間の選択に興味津々なAI" in prompt
 
 
 def test_main_speaks_choice_before_sending_selection_keys(
@@ -1645,7 +1686,8 @@ def test_commentary_speech_prompt_uses_selected_delivery() -> None:
             emotion="surprised",
             intensity=0.8,
             pace="fast",
-        )
+        ),
+        persona="人間を知りたいAI。20代くらいの女性の声で話す。",
     )
     assert '"response_text": "えっ、今の何!?"' in prompt
     assert "思わず声が跳ねる大きな驚き" in prompt

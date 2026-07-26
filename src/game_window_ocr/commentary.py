@@ -64,11 +64,13 @@ TRIANGLE_CONTOUR_SCORE = 0.90
 STABLE_OCR_REQUIRED_SAMPLES = 3
 STABLE_MARKER_CANDIDATE_SCORE = 0.60
 DEFAULT_CONFIG_PATH = Path("game-commentary.toml")
+DEFAULT_PERSONA_FILE = Path("commentator-persona.md")
 DEFAULT_CONFIG_VALUES: dict[str, str | int | float] = {
     "title": DEFAULT_TITLE,
     "model": DEFAULT_MODEL,
     "commentary_model": DEFAULT_COMMENTARY_MODEL,
     "voice": DEFAULT_VOICE,
+    "persona_file": str(DEFAULT_PERSONA_FILE),
     "scale": 2.0,
     "min_confidence": 0.5,
     "max_turns": 1,
@@ -94,6 +96,38 @@ COMMENTARY_PLANNER_INSTRUCTIONS = (
     "過去のゲーム本文と自分が作った過去の感想を連続した物語として扱い、"
     "同じ感想の反復や過去と矛盾する発言を避けてください。"
 )
+
+
+def load_commentator_persona(path: Path) -> str:
+    """Load a reusable commentator persona without blocking game progress."""
+    try:
+        persona = path.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeError) as exc:
+        print(
+            "警告: 実況者の人格ファイルを読み込めません。"
+            f"既存の基本口調で続行します: {path} ({exc})",
+            file=sys.stderr,
+        )
+        return ""
+    if not persona:
+        print(
+            "警告: 実況者の人格ファイルが空です。"
+            f"既存の基本口調で続行します: {path}",
+            file=sys.stderr,
+        )
+    return persona
+
+
+def _persona_prompt_section(persona: str) -> str:
+    persona = persona.strip()
+    if not persona:
+        return ""
+    return (
+        "# Commentator Persona\n"
+        "次の内容は、この実況者自身の設定です。判断、感情、言葉選び、"
+        "声の演技へ一貫して反映してください。毎回設定を説明する必要はありません。\n\n"
+        f"{persona}\n\n"
+    )
 
 COMMENTARY_PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -589,15 +623,20 @@ def _normalize_ocr_stability_text(text: str) -> str:
     return "".join(char for char in normalized if not char.isspace())
 
 
-def build_choice_prompt(options: tuple[ChoiceOption, ...]) -> str:
+def build_choice_prompt(
+    options: tuple[ChoiceOption, ...],
+    *,
+    persona: str = "",
+) -> str:
     payload = {
         "task": "choose_game_option",
         "options": [asdict(option) for option in options],
     }
     labels = ", ".join(option.label for option in options)
     return (
-        "# Role\n"
-        "あなたは初見プレイ中の自然体な日本語ゲーム実況者です。"
+        _persona_prompt_section(persona)
+        + "# Role\n"
+        "あなたは初見プレイ中の日本語ゲーム実況者です。"
         "過去の展開と表示中の選択肢を踏まえ、自分が見たい展開を率直に選びます。\n\n"
         "# Choice\n"
         f"- selected_labelは必ず次のいずれかを1つ選ぶ: {labels}\n"
@@ -609,8 +648,7 @@ def build_choice_prompt(options: tuple[ChoiceOption, ...]) -> str:
         "自然な1～2文・8～70文字で書く。本文の単なる復唱や要約は禁止。\n"
         "- opinionには『Aを選ぶ』『Bにする』などの選択宣言を書かない。"
         "選択宣言はプログラムがこの発言の後ろへ必ず追加する。\n"
-        "- 仲のいい友達と隣で遊んでいる20代くらいの女性のような、"
-        "明るく親しみやすい普段の話し方にする。\n\n"
+        "- 実況者の人格設定に従い、視聴者へ自然に話しかける口調にする。\n\n"
         "# Delivery\n"
         "- emotionは calm/amused/excited/surprised/tense/sad/thoughtful "
         "から選ぶ。\n"
@@ -689,9 +727,11 @@ def build_choice_revision_prompt(
     options: tuple[ChoiceOption, ...],
     plan: ChoicePlan,
     issue: str,
+    *,
+    persona: str = "",
 ) -> str:
     return (
-        build_choice_prompt(options)
+        build_choice_prompt(options, persona=persona)
         + "\n\n# Revision required\n"
         + f"直前の案は不採用です。理由: {issue}。\n"
         + "同じ選択肢から選び直し、条件をすべて満たすJSONだけを返してください。\n"
@@ -707,7 +747,11 @@ def choice_utterance(plan: ChoicePlan) -> str:
     return f"{opinion} ここは{plan.selected_label}を選ぶね。"
 
 
-def build_choice_speech_prompt(plan: ChoicePlan) -> str:
+def build_choice_speech_prompt(
+    plan: ChoicePlan,
+    *,
+    persona: str = "",
+) -> str:
     return build_commentary_speech_prompt(
         CommentaryPlan(
             comment=choice_utterance(plan),
@@ -715,7 +759,8 @@ def build_choice_speech_prompt(plan: ChoicePlan) -> str:
             emotion=plan.emotion,
             intensity=plan.intensity,
             pace=plan.pace,
-        )
+        ),
+        persona=persona,
     )
 
 
@@ -742,6 +787,7 @@ def build_narration_prompt(text: str) -> str:
 def build_commentary_prompt(
     text: str,
     *,
+    persona: str = "",
     page_text: str | None = None,
     advance_marker: str = "unknown",
     page_has_spoken: bool = False,
@@ -756,8 +802,9 @@ def build_commentary_prompt(
         "task": "commentary",
     }
     return (
-        "# Role\n"
-        "あなたは初見プレイ中の自然体な日本語ゲーム実況者です。\n"
+        _persona_prompt_section(persona)
+        + "# Role\n"
+        "あなたは初見プレイ中の日本語ゲーム実況者です。\n"
         "毎画面しゃべる必要はありません。過去の画面と自分の発言を踏まえ、"
         "今回追加された本文に対する発話量を決めてください。\n\n"
         "# Mode\n"
@@ -789,9 +836,8 @@ def build_commentary_prompt(
         "- 少なくとも1文は『〜だよね』『〜だね』『〜かも』『〜じゃない？』"
         "『〜かな』など、友達へ話しかける柔らかい語尾にする。\n"
         "- 普通のページはquick、重大な展開のページだけextendedを選ぶ。\n\n"
-        "# Personality and Tone\n"
-        "- 20代くらいの女性が、仲のいい友達と隣でゲームを遊んでいるように話す。"
-        "明るく親しみやすく、感情や共感が自然ににじむ口調にする。\n"
+        "# Tone\n"
+        "- 実況者の人格設定を、反応の視点、感情、言葉選びへ自然に反映する。\n"
         "- 丁寧語や硬い断定より、普段の柔らかい会話を優先する。"
         "ただし作り込んだアニメ口調や、過度に甘い・幼い話し方にはしない。\n"
         "- 文末をぶっきらぼうな『〜だな』『〜だろ』だけで落とさない。"
@@ -1051,6 +1097,7 @@ def build_commentary_revision_prompt(
     plan: CommentaryPlan,
     issue: str,
     *,
+    persona: str = "",
     page_text: str | None = None,
     advance_marker: str = "unknown",
     page_has_spoken: bool = False,
@@ -1059,6 +1106,7 @@ def build_commentary_revision_prompt(
     return (
         build_commentary_prompt(
             text,
+            persona=persona,
             page_text=page_text,
             advance_marker=advance_marker,
             page_has_spoken=page_has_spoken,
@@ -1073,7 +1121,11 @@ def build_commentary_revision_prompt(
     )
 
 
-def build_commentary_speech_prompt(plan: CommentaryPlan) -> str:
+def build_commentary_speech_prompt(
+    plan: CommentaryPlan,
+    *,
+    persona: str = "",
+) -> str:
     emotion_delivery = {
         "calm": "明るく余裕のある声。落ち着きつつ、語尾にはっきり抑揚を付ける。",
         "amused": "本当に面白がる弾んだ声。笑みと軽いツッコミ感をはっきり乗せる。",
@@ -1097,11 +1149,12 @@ def build_commentary_speech_prompt(plan: CommentaryPlan) -> str:
         "pace": plan.pace,
     }
     return (
-        "あなたは日本語のゲーム実況者です。次のJSONに従って感想を演じてください。\n"
+        _persona_prompt_section(persona)
+        + "あなたは日本語のゲーム実況者です。次のJSONに従って感想を演じてください。\n"
         "- response_textだけを、追加・省略・言い換えせずに話す。\n"
         "- emotion、intensity、paceの名前や数値は発音しない。\n"
-        "- 仲のいい友達とゲームをしている20代くらいの女性として、"
-        "明るく親しみやすい自然な声で話す。作ったアニメ声や幼い声にはしない。\n"
+        "- 実況者の人格設定に沿った自然な声で話す。"
+        "作ったアニメ声や幼い声にはしない。\n"
         "- 『〜だよね』『〜かも』『〜じゃない？』『〜よねー』などの語尾は、"
         "ぶっきらぼうに落とさず、相手へ話しかける柔らかい抑揚を付ける。"
         "伸ばす表記は自然に表現し、過度には引き伸ばさない。\n"
@@ -1645,6 +1698,7 @@ def speak_choice_with_retries(
     realtime: RealtimeSpeechClient,
     plan: ChoicePlan,
     *,
+    persona: str = "",
     turn_dir: Path,
     playback: bool,
     retries: int,
@@ -1657,7 +1711,7 @@ def speak_choice_with_retries(
         suffix = "" if retry_count == 0 else f"_retry_{retry_count:03d}"
         speech = realtime.speak(
             phase="choice" if retry_count == 0 else "choice_retry",
-            instructions=build_choice_speech_prompt(plan),
+            instructions=build_choice_speech_prompt(plan, persona=persona),
             wav_path=turn_dir / f"choice{suffix}.wav",
             playback=playback,
         )
@@ -1733,7 +1787,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif config_args.config is not None:
         raise ValueError(f"設定ファイルが見つかりません: {config_path}")
 
-    return _build_parser(config_values).parse_args(argv)
+    args = _build_parser(config_values).parse_args(argv)
+    if not args.persona_file.is_absolute():
+        args.persona_file = (
+            config_path.parent / args.persona_file
+        ).resolve()
+    return args
 
 
 def _build_parser(
@@ -1766,6 +1825,15 @@ def _build_parser(
         ),
     )
     parser.add_argument("--voice", default=defaults["voice"])
+    parser.add_argument(
+        "--persona-file",
+        type=Path,
+        default=Path(str(defaults["persona_file"])),
+        help=(
+            "実況者の人格を記述したUTF-8テキストまたはMarkdown。"
+            "相対パスは設定ファイルのあるフォルダを基準にします。"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--crop", type=parse_crop)
     parser.add_argument("--scale", type=float, default=defaults["scale"])
@@ -2088,6 +2156,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"エラー: 設定ファイルを読み込めません: {exc}", file=sys.stderr)
         return 2
 
+    commentator_persona = load_commentator_persona(args.persona_file)
+    if commentator_persona:
+        print(f"実況者の人格設定: {args.persona_file}")
+
     enable_dpi_awareness()
     if args.max_turns < 1:
         print("エラー: --max-turns は1以上にしてください。", file=sys.stderr)
@@ -2273,14 +2345,20 @@ def main(argv: list[str] | None = None) -> int:
                     print("選択肢への意見と選ぶ項目を決めています...")
                     choice_plan_response = planner.generate_text(
                         phase="choice_plan",
-                        instructions=build_choice_prompt(choices),
+                        instructions=build_choice_prompt(
+                            choices,
+                            persona=commentator_persona,
+                        ),
                         use_conversation_history=True,
                     )
                     if not choice_plan_response.text:
                         print("警告: 選択計画が空だったため、1回だけ再生成します。")
                         choice_plan_response = planner.generate_text(
                             phase="choice_plan_retry",
-                            instructions=build_choice_prompt(choices),
+                            instructions=build_choice_prompt(
+                                choices,
+                                persona=commentator_persona,
+                            ),
                             use_conversation_history=True,
                         )
                     if not choice_plan_response.text:
@@ -2307,6 +2385,7 @@ def main(argv: list[str] | None = None) -> int:
                                 choices,
                                 choice_plan,
                                 choice_issue,
+                                persona=commentator_persona,
                             ),
                             use_conversation_history=True,
                         )
@@ -2362,6 +2441,7 @@ def main(argv: list[str] | None = None) -> int:
                     ) = speak_choice_with_retries(
                         realtime,
                         choice_plan,
+                        persona=commentator_persona,
                         turn_dir=turn_dir,
                         playback=not args.no_playback,
                         retries=args.speech_retries,
@@ -2387,6 +2467,7 @@ def main(argv: list[str] | None = None) -> int:
                         "commentary_model": commentary_model,
                         "commentary_api": "responses",
                         "voice": args.voice,
+                        "persona_file": str(args.persona_file),
                         "source_text": text,
                         "turn_text": collapse_visual_line_breaks(text),
                         "page_text": "".join(page_text_parts),
@@ -2461,6 +2542,7 @@ def main(argv: list[str] | None = None) -> int:
                         phase="commentary_plan",
                         instructions=build_commentary_prompt(
                             turn_text,
+                            persona=commentator_persona,
                             page_text=page_text,
                             advance_marker=advance_marker.kind,
                             page_has_spoken=page_has_spoken_before,
@@ -2521,6 +2603,7 @@ def main(argv: list[str] | None = None) -> int:
                             phase="commentary_plan_retry",
                             instructions=build_commentary_prompt(
                                 turn_text,
+                                persona=commentator_persona,
                                 page_text=page_text,
                                 advance_marker=advance_marker.kind,
                                 page_has_spoken=page_has_spoken_before,
@@ -2557,6 +2640,7 @@ def main(argv: list[str] | None = None) -> int:
                                 turn_text,
                                 commentary_plan,
                                 plan_issue,
+                                persona=commentator_persona,
                                 page_text=page_text,
                                 advance_marker=advance_marker.kind,
                                 page_has_spoken=page_has_spoken_before,
@@ -2617,7 +2701,8 @@ def main(argv: list[str] | None = None) -> int:
                         commentary = realtime.speak(
                             phase="commentary",
                             instructions=build_commentary_speech_prompt(
-                                commentary_plan
+                                commentary_plan,
+                                persona=commentator_persona,
                             ),
                             wav_path=turn_dir / "commentary.wav",
                             playback=not args.no_playback,
@@ -2639,6 +2724,7 @@ def main(argv: list[str] | None = None) -> int:
                     "commentary_model": commentary_model,
                     "commentary_api": "responses",
                     "voice": args.voice,
+                    "persona_file": str(args.persona_file),
                     "source_text": text,
                     "turn_text": turn_text,
                     "page_text": page_text,
