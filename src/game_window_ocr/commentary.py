@@ -229,16 +229,44 @@ def load_initial_intro(
     return message
 
 
-def _persona_prompt_section(persona: str) -> str:
+def _persona_prompt_section(
+    persona: str,
+    *,
+    startup: bool = False,
+) -> str:
     persona = persona.strip()
+    phase_rule = (
+        "これは実況セッション開始時の最初の挨拶です。"
+        f"開始句として「{STARTUP_GREETING}」を使用できます。\n\n"
+        if startup
+        else (
+            "これは実況セッション開始時の挨拶ではありません。人格設定に開始挨拶の"
+            f"指定があっても今は実行せず、「{STARTUP_GREETING.rstrip('。')}」を"
+            "発話内容へ含めないでください。\n\n"
+        )
+    )
     if not persona:
-        return ""
+        return "# Current phase\n" + phase_rule
     return (
         "# Commentator Persona\n"
         "次の内容は、この実況者自身の設定です。判断、感情、言葉選び、"
         "声の演技へ一貫して反映してください。毎回設定を説明する必要はありません。\n\n"
         f"{persona}\n\n"
+        "# Current phase\n"
+        + phase_rule
     )
+
+
+def _remove_startup_greeting(text: str) -> str:
+    """Keep the session-only greeting out of generated non-startup speech."""
+    greeting = re.escape(STARTUP_GREETING.rstrip("。"))
+    cleaned = re.sub(
+        rf"{greeting}[。．.!！?？、,\s]*",
+        "",
+        text,
+    )
+    return cleaned.strip(" \t\r\n\u3000、,")
+
 
 COMMENTARY_PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -514,7 +542,9 @@ def apply_commentary_plan_replacements(
 ) -> CommentaryPlan:
     return replace(
         plan,
-        comment=apply_ocr_replacements(plan.comment, replacements),
+        comment=_remove_startup_greeting(
+            apply_ocr_replacements(plan.comment, replacements)
+        ),
     )
 
 
@@ -524,7 +554,9 @@ def apply_choice_plan_replacements(
 ) -> ChoicePlan:
     return replace(
         plan,
-        opinion=apply_ocr_replacements(plan.opinion, replacements),
+        opinion=_remove_startup_greeting(
+            apply_ocr_replacements(plan.opinion, replacements)
+        ),
     )
 
 
@@ -534,14 +566,20 @@ def apply_closing_plan_replacements(
 ) -> ClosingPlan:
     return replace(
         plan,
-        ending_line=apply_ocr_replacements(plan.ending_line, replacements),
-        session_impression=apply_ocr_replacements(
-            plan.session_impression,
-            replacements,
+        ending_line=_remove_startup_greeting(
+            apply_ocr_replacements(plan.ending_line, replacements)
         ),
-        call_to_action=apply_ocr_replacements(
-            plan.call_to_action,
-            replacements,
+        session_impression=_remove_startup_greeting(
+            apply_ocr_replacements(
+                plan.session_impression,
+                replacements,
+            )
+        ),
+        call_to_action=_remove_startup_greeting(
+            apply_ocr_replacements(
+                plan.call_to_action,
+                replacements,
+            )
         ),
     )
 
@@ -916,6 +954,8 @@ def build_choice_prompt(
         "# Opinion\n"
         "- opinionには、選択肢への意見、理由、期待、ツッコミのいずれかを"
         "自然な1～2文・8～70文字で書く。本文の単なる復唱や要約は禁止。\n"
+        f"- 今回は開始挨拶ではないため、「{STARTUP_GREETING.rstrip('。')}」や"
+        "自己紹介をopinionへ含めない。\n"
         "- opinionには『Aを選ぶ』『Bにする』などの選択宣言を書かない。"
         "選択宣言はプログラムがこの発言の後ろへ必ず追加する。\n"
         "- 実況者の人格設定に従い、視聴者へ自然に話しかける口調にする。\n\n"
@@ -952,7 +992,9 @@ def parse_choice_plan(raw_text: str) -> ChoicePlan:
     ).strip().upper()
     if not re.fullmatch(r"[A-Z]", selected_label):
         selected_label = ""
-    opinion = str(payload.get("opinion", payload.get("comment", ""))).strip()
+    opinion = _remove_startup_greeting(
+        str(payload.get("opinion", payload.get("comment", ""))).strip()
+    )
     emotion = str(payload.get("emotion", "thoughtful")).strip().casefold()
     if emotion not in COMMENTARY_EMOTIONS:
         emotion = "thoughtful"
@@ -1050,6 +1092,8 @@ def build_closing_prompt(
         _persona_prompt_section(persona)
         + "# Closing message\n"
         "今回の実況内容を踏まえ、YouTube動画の最後に自然に話す締めを作る。\n"
+        f"- 「{STARTUP_GREETING.rstrip('。')}」は開始時専用なので、締めには"
+        "含めない。\n"
         "- ending_line: 区切りがよいので今日はこの辺で終える旨を1文で話す。\n"
         "- session_impression: 今回実際に起きたことへの簡単な感想を1～2文で話す。\n"
         "- call_to_action: 動画が気に入った視聴者へ、チャンネル登録と高評価を"
@@ -1075,9 +1119,15 @@ def parse_closing_plan(raw_text: str) -> ClosingPlan:
     except (TypeError, ValueError):
         intensity = 0.65
     return ClosingPlan(
-        ending_line=str(payload.get("ending_line", "")).strip(),
-        session_impression=str(payload.get("session_impression", "")).strip(),
-        call_to_action=str(payload.get("call_to_action", "")).strip(),
+        ending_line=_remove_startup_greeting(
+            str(payload.get("ending_line", "")).strip()
+        ),
+        session_impression=_remove_startup_greeting(
+            str(payload.get("session_impression", "")).strip()
+        ),
+        call_to_action=_remove_startup_greeting(
+            str(payload.get("call_to_action", "")).strip()
+        ),
         emotion=emotion,
         intensity=min(1.0, max(0.55, intensity)),
         pace=pace,
@@ -1321,6 +1371,8 @@ def build_commentary_prompt(
         "リズムを作る。\n\n"
         "# Style\n"
         "- 実況者本人の率直な反応、ツッコミ、共感、予想として話す。\n"
+        f"- 今回は開始挨拶ではないため、「{STARTUP_GREETING.rstrip('。')}」や"
+        "自己紹介をcommentへ含めず、ゲームへの反応から直接話し始める。\n"
         "- 本文の復唱、要約、作品講評、詩的・抽象的・意味深なコピーは禁止。\n"
         "- 本文にない出来事や設定を作らず、普通の日常語で自然に言い切る。\n"
         "- 相づちは『へぇ』『あ、なるほど』『え、マジ？』などを、"
@@ -1406,7 +1458,7 @@ def parse_commentary_plan(raw_text: str) -> CommentaryPlan:
         if "comment" in loose_payload:
             payload = loose_payload
     if not isinstance(payload, dict):
-        fallback = raw.strip("` \r\n\"")
+        fallback = _remove_startup_greeting(raw.strip("` \r\n\""))
         return CommentaryPlan(
             comment=fallback[:100] or "……。",
             mode="quick",
@@ -1420,7 +1472,9 @@ def parse_commentary_plan(raw_text: str) -> CommentaryPlan:
     ).strip().casefold()
     if mode not in COMMENTARY_MODES:
         mode = "quick"
-    comment = str(payload.get("comment", "")).strip()
+    comment = _remove_startup_greeting(
+        str(payload.get("comment", "")).strip()
+    )
     if mode == "silent":
         comment = ""
     elif not comment:
@@ -1599,6 +1653,7 @@ def build_commentary_speech_prompt(
     plan: CommentaryPlan,
     *,
     persona: str = "",
+    startup: bool = False,
 ) -> str:
     emotion_delivery = {
         "calm": "明るく余裕のある声。落ち着きつつ、語尾にはっきり抑揚を付ける。",
@@ -1615,7 +1670,11 @@ def build_commentary_speech_prompt(
         "fast": "少し速め。ただし聞き取りやすさを保つ。",
     }[plan.pace]
     payload = {
-        "response_text": plan.comment,
+        "response_text": (
+            plan.comment
+            if startup
+            else _remove_startup_greeting(plan.comment)
+        ),
         "require_repeat_verbatim": True,
         "mode": plan.mode,
         "emotion": plan.emotion,
@@ -1623,10 +1682,18 @@ def build_commentary_speech_prompt(
         "pace": plan.pace,
     }
     return (
-        _persona_prompt_section(persona)
+        _persona_prompt_section(persona, startup=startup)
         + "あなたは日本語のゲーム実況者です。次のJSONに従って感想を演じてください。\n"
         "- response_textだけを、追加・省略・言い換えせずに話す。\n"
-        "- emotion、intensity、paceの名前や数値は発音しない。\n"
+        + (
+            "- 今回は開始挨拶なので、response_textに含まれる開始句をそのまま話す。\n"
+            if startup
+            else (
+                f"- 今回は開始挨拶ではない。「{STARTUP_GREETING.rstrip('。')}」や"
+                "自己紹介をresponse_textの前後へ追加しない。\n"
+            )
+        )
+        + "- emotion、intensity、paceの名前や数値は発音しない。\n"
         "- 実況者の人格設定に沿った自然な声で話す。"
         "作ったアニメ声や幼い声にはしない。\n"
         "- 『〜だよね』『〜かも』『〜じゃない？』『〜よねー』などの語尾は、"
@@ -3098,6 +3165,7 @@ def _deliver_startup_message(
             instructions=build_commentary_speech_prompt(
                 plan,
                 persona=persona,
+                startup=True,
             ),
             wav_path=root / "startup.wav",
             playback=playback,

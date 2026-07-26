@@ -523,6 +523,8 @@ def test_commentary_prompt_limits_length_and_repetition() -> None:
     assert "20代くらいの女性" in prompt
     assert "短めの2～3文・合計28～90文字" in prompt
     assert "頼りになりそうだよね" in prompt
+    assert "今回は開始挨拶ではない" in prompt
+    assert "「ごきげんよう」" in prompt
 
 
 def test_extract_choice_options_keeps_multiline_option_text() -> None:
@@ -1954,6 +1956,14 @@ def test_parse_commentary_plan() -> None:
     )
 
 
+def test_parse_commentary_plan_removes_startup_only_greeting() -> None:
+    plan = parse_commentary_plan(
+        '{"mode":"quick","comment":"ごきげんようこれは怪しいね。",'
+        '"emotion":"tense","intensity":0.75,"pace":"slow"}'
+    )
+    assert plan.comment == "これは怪しいね。"
+
+
 def test_parse_commentary_plan_handles_fence_and_invalid_values() -> None:
     plan = parse_commentary_plan(
         '```json\n{"comment":"気になるね","emotion":"unknown",'
@@ -2237,6 +2247,23 @@ def test_commentary_speech_prompt_uses_selected_delivery() -> None:
     assert "普段の会話よりリアクションを一段大きく" in prompt
     assert "少し速め" in prompt
     assert "0.80" in prompt
+    assert "今回は開始挨拶ではない" in prompt
+
+
+def test_commentary_speech_prompt_allows_greeting_only_for_startup() -> None:
+    plan = CommentaryPlan(
+        comment="ごきげんよう。スカイナです。",
+        mode="extended",
+        emotion="calm",
+        intensity=0.6,
+        pace="normal",
+    )
+    commentary_prompt = build_commentary_speech_prompt(plan)
+    startup_prompt = build_commentary_speech_prompt(plan, startup=True)
+    assert '"response_text": "スカイナです。"' in commentary_prompt
+    assert "これは実況セッション開始時の最初の挨拶です" in startup_prompt
+    assert "今回は開始挨拶なので" in startup_prompt
+    assert "今回は開始挨拶ではない" not in startup_prompt
 
 
 def test_narration_match_ignores_spaces_and_punctuation() -> None:

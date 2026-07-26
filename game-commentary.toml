@@ -20,7 +20,7 @@ min_confidence = 0.5
 # 0は時間終了まで無制限。正数にすると画面数の安全上限になります。
 max_turns = 0
 # 準備完了後、この時間を過ぎたら本マークまたは選択肢で実況を締めます。
-session_duration_minutes = 5.0
+session_duration_minutes = 20.0
 # 自然な区切りが来ない場合に待つ最大時間。
 ending_grace_minutes = 5.0
 
