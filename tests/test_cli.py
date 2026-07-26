@@ -37,6 +37,14 @@ from game_window_ocr.commentary import (
 from game_window_ocr.windows import normalize_title
 
 
+def _subtitle_cue_lines(subtitles: str) -> list[list[str]]:
+    return [
+        block.splitlines()[2:]
+        for block in subtitles.strip().split("\n\n")
+        if block.strip()
+    ]
+
+
 def test_title_normalization_matches_ascii_and_full_width() -> None:
     assert normalize_title("かまいたちの夜x3") == normalize_title(
         "かまいたちの夜×３"
@@ -745,6 +753,53 @@ def test_choice_speech_retries_until_selection_is_confirmed(
     subtitle_utterance = utterance.replace("。 ", "。\n")
     assert subtitles.count(subtitle_utterance) == 2
     assert subtitles.count(" --> ") == 2
+
+
+def test_regular_speech_subtitle_is_not_split_into_multiple_cues(
+    tmp_path,
+) -> None:
+    subtitle_path = tmp_path / "subtitles" / "commentary.srt"
+    writer = commentary_module.SrtSubtitleWriter(subtitle_path)
+    speech = SpeechResult(
+        phase="commentary",
+        transcript="一文目。二文目。三文目。",
+        audio_bytes=100,
+        response_id=None,
+        started_at_seconds=1.0,
+        ended_at_seconds=4.0,
+    )
+
+    commentary_module._append_speech_subtitle(
+        writer,
+        "一文目。二文目。三文目。",
+        speech,
+    )
+
+    subtitles = subtitle_path.read_text(encoding="utf-8-sig")
+    assert subtitles.count(" --> ") == 1
+    assert _subtitle_cue_lines(subtitles) == [
+        ["一文目。", "二文目。", "三文目。"]
+    ]
+
+
+def test_speech_subtitle_with_missing_timing_is_skipped(tmp_path) -> None:
+    subtitle_path = tmp_path / "subtitles" / "commentary.srt"
+    writer = commentary_module.SrtSubtitleWriter(subtitle_path)
+    speech = SpeechResult(
+        phase="startup",
+        transcript="開始します。",
+        audio_bytes=100,
+        response_id=None,
+    )
+
+    commentary_module._append_speech_subtitle(
+        writer,
+        "開始します。",
+        speech,
+        max_lines_per_cue=2,
+    )
+
+    assert subtitle_path.read_bytes() == b"\xef\xbb\xbf"
 
 
 def test_choice_prompt_contains_only_available_labels() -> None:
@@ -2661,8 +2716,13 @@ def test_resume_startup_summarizes_memory_and_saves_speech_artifacts(
     assert (root / "startup_transcript.txt").read_text(
         encoding="utf-8"
     ) == "再開挨拶の転写\n"
-    subtitle_message = record["message"].replace("。", "。\n").rstrip()
-    assert subtitle_message in subtitles
+    cue_lines = _subtitle_cue_lines(subtitles)
+    assert len(cue_lines) == 3
+    assert all(1 <= len(lines) <= 2 for lines in cue_lines)
+    subtitle_message = "".join(
+        line for lines in cue_lines for line in lines
+    )
+    assert subtitle_message == record["message"]
 
 
 def test_startup_rejects_preface_and_retries_before_playback(tmp_path) -> None:
@@ -2725,7 +2785,11 @@ def test_startup_rejects_preface_and_retries_before_playback(tmp_path) -> None:
         encoding="utf-8"
     ).strip() == message
     subtitles = subtitle_path.read_text(encoding="utf-8-sig")
-    assert subtitles.count(" --> ") == 1
+    assert subtitles.count(" --> ") == 2
+    assert all(
+        1 <= len(lines) <= 2
+        for lines in _subtitle_cue_lines(subtitles)
+    )
 
 
 def test_startup_continues_when_both_guarded_attempts_are_rejected(
@@ -2807,6 +2871,50 @@ def test_initial_startup_uses_fixed_file_without_planner(tmp_path) -> None:
     assert record["message"].startswith("ごきげんよう。")
     assert "かまいたちの夜" in record["message"]
     assert spoken_phases == ["startup"]
+
+
+def test_closing_subtitle_is_split_into_two_line_timed_cues(tmp_path) -> None:
+    plan = commentary_module.ClosingPlan(
+        ending_line="あ。い。",
+        session_impression="う。",
+        call_to_action="え。",
+        emotion="calm",
+        intensity=0.5,
+        pace="normal",
+    )
+
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            return SpeechResult(
+                phase=str(kwargs["phase"]),
+                transcript=plan.message,
+                audio_bytes=100,
+                response_id=None,
+                started_at_seconds=10.0,
+                ended_at_seconds=18.0,
+            )
+
+    root = tmp_path / "session"
+    root.mkdir()
+    subtitle_path = root / "subtitles" / "commentary.srt"
+    commentary_module._deliver_closing_message(
+        plan=plan,
+        realtime=FakeRealtime(),
+        subtitle_writer=commentary_module.SrtSubtitleWriter(subtitle_path),
+        root=root,
+        persona="",
+        playback=False,
+        generation_errors=[],
+        response=None,
+    )
+
+    subtitles = subtitle_path.read_text(encoding="utf-8-sig")
+    assert _subtitle_cue_lines(subtitles) == [
+        ["あ。", "い。"],
+        ["う。", "え。"],
+    ]
+    assert "00:00:10,000 --> 00:00:14,000" in subtitles
+    assert "00:00:14,000 --> 00:00:18,000" in subtitles
 
 
 def test_session_and_overall_memories_are_created_and_updated(tmp_path) -> None:

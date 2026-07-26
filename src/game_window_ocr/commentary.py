@@ -2997,17 +2997,27 @@ def _append_speech_subtitle(
     writer: SrtSubtitleWriter,
     text: str,
     speech: SpeechResult,
+    *,
+    max_lines_per_cue: int | None = None,
 ) -> None:
     if (
         speech.started_at_seconds is None
         or speech.ended_at_seconds is None
     ):
         return
-    writer.add_cue(
-        text,
-        start_seconds=speech.started_at_seconds,
-        end_seconds=speech.ended_at_seconds,
-    )
+    if max_lines_per_cue is None:
+        writer.add_cue(
+            text,
+            start_seconds=speech.started_at_seconds,
+            end_seconds=speech.ended_at_seconds,
+        )
+    else:
+        writer.add_grouped_cues(
+            text,
+            start_seconds=speech.started_at_seconds,
+            end_seconds=speech.ended_at_seconds,
+            max_lines_per_cue=max_lines_per_cue,
+        )
 
 
 def _write_unselected_choice_result(
@@ -3355,7 +3365,12 @@ def _deliver_startup_message(
             )
         if not speech.playback_suppressed:
             try:
-                _append_speech_subtitle(subtitle_writer, message, speech)
+                _append_speech_subtitle(
+                    subtitle_writer,
+                    message,
+                    speech,
+                    max_lines_per_cue=2,
+                )
             except (OSError, ValueError) as exc:
                 print(
                     f"警告: 開始挨拶の字幕を保存できませんでした: {exc}",
@@ -3489,7 +3504,12 @@ def _deliver_closing_message(
                 file=sys.stderr,
             )
         try:
-            _append_speech_subtitle(subtitle_writer, plan.message, speech)
+            _append_speech_subtitle(
+                subtitle_writer,
+                plan.message,
+                speech,
+                max_lines_per_cue=2,
+            )
         except (OSError, ValueError) as exc:
             print(
                 f"警告: 締め字幕を保存できませんでした: {exc}",
