@@ -83,6 +83,10 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
     config_path.write_text(
         "ocr_interval = 0.75\n"
         "stable_ocr_samples = 4\n"
+        "session_duration_minutes = 30.0\n"
+        "ending_grace_minutes = 2.5\n"
+        'summary_model = "gpt-5.6-terra"\n'
+        'memory_dir = "memories"\n'
         'persona_file = "personas/curious-ai.md"\n',
         encoding="utf-8",
     )
@@ -96,15 +100,46 @@ def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
             str(config_path),
             "--ocr-interval",
             "0.25",
+            "--session-duration-minutes",
+            "15",
         ]
     )
 
     assert configured.ocr_interval == pytest.approx(0.75)
     assert configured.stable_ocr_samples == 4
+    assert configured.session_duration_minutes == pytest.approx(30.0)
+    assert configured.ending_grace_minutes == pytest.approx(2.5)
+    assert configured.summary_model == "gpt-5.6-terra"
+    assert configured.memory_dir == (tmp_path / "memories").resolve()
     assert configured.persona_file == (
         tmp_path / "personas" / "curious-ai.md"
     ).resolve()
     assert overridden.ocr_interval == pytest.approx(0.25)
+    assert overridden.session_duration_minutes == pytest.approx(15.0)
+
+
+def test_commentary_defaults_to_timed_unlimited_live_session() -> None:
+    args = commentary_module._build_parser().parse_args([])
+
+    assert args.max_turns == 0
+    assert args.session_duration_minutes == pytest.approx(20.0)
+    assert args.ending_grace_minutes == pytest.approx(5.0)
+    assert args.summary_model == "gpt-5.6-luna"
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--max-turns", "-1"),
+        ("--session-duration-minutes", "0"),
+        ("--ending-grace-minutes", "-0.1"),
+    ],
+)
+def test_invalid_session_ending_options_are_rejected(
+    option: str,
+    value: str,
+) -> None:
+    assert commentary_module.main([option, value]) == 2
 
 
 def test_commentator_persona_is_loaded_as_utf8_markdown(tmp_path) -> None:
@@ -1736,6 +1771,847 @@ def test_narration_match_accepts_good_orthographic_variation() -> None:
         "このノリ、いい味出てる。",
         "このノリ、良い味出てる。",
     )
+
+
+def test_session_stop_reason_waits_for_breakpoint_then_uses_grace() -> None:
+    kwargs = {
+        "session_started_at": 100.0,
+        "duration_seconds": 1_200.0,
+        "grace_seconds": 300.0,
+    }
+
+    assert (
+        commentary_module._session_stop_reason(
+            now=1_299.0,
+            marker_kind="book",
+            **kwargs,
+        )
+        is None
+    )
+    assert commentary_module._session_stop_reason(
+        now=1_300.0,
+        marker_kind="book",
+        **kwargs,
+    ) == "duration_breakpoint"
+    assert commentary_module._session_stop_reason(
+        now=1_350.0,
+        marker_kind="choices",
+        **kwargs,
+    ) == "duration_breakpoint"
+    assert (
+        commentary_module._session_stop_reason(
+            now=1_499.0,
+            marker_kind="triangle",
+            **kwargs,
+        )
+        is None
+    )
+    assert commentary_module._session_stop_reason(
+        now=1_600.0,
+        marker_kind="triangle",
+        **kwargs,
+    ) == "duration_grace_elapsed"
+
+
+def test_capture_and_ocr_stops_at_session_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    clock = 0.0
+
+    def fake_monotonic() -> float:
+        nonlocal clock
+        clock += 0.2
+        return clock
+
+    monkeypatch.setattr(commentary_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: (
+            image,
+            commentary_module.AdvanceMarker("none", 0.4, None),
+        ),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "capture_client",
+        lambda *args, **kwargs: image,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        lambda *args, **kwargs: "まだ表示中の本文",
+    )
+    args = commentary_module._build_parser().parse_args(
+        ["--stable-ocr-samples", "99"]
+    )
+
+    text, marker = commentary_module._capture_and_ocr(
+        object(),
+        tmp_path,
+        args,
+        object(),
+        hard_deadline=1.0,
+    )
+
+    assert text == "まだ表示中の本文"
+    assert marker.kind == "session_end"
+    assert marker.fallback_reason == "session_grace_elapsed"
+
+
+def test_marker_poll_sleep_does_not_cross_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    clock = 0.0
+    slept: list[float] = []
+
+    monkeypatch.setattr(commentary_module.time, "monotonic", lambda: clock)
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal clock
+        slept.append(seconds)
+        clock += seconds
+
+    monkeypatch.setattr(commentary_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        commentary_module,
+        "capture_client",
+        lambda *args, **kwargs: image,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "detect_advance_marker",
+        lambda *args, **kwargs: commentary_module.AdvanceMarker(
+            "none",
+            0.0,
+            None,
+        ),
+    )
+
+    _image, marker = commentary_module.wait_for_advance_marker(
+        object(),
+        activate=False,
+        timeout=0.5,
+        poll_interval=10.0,
+    )
+
+    assert marker.kind == "none"
+    assert slept == [0.5]
+
+
+def test_capture_and_ocr_takes_final_capture_when_deadline_already_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    image = Image.new("RGB", (960, 540), "black")
+    monkeypatch.setattr(commentary_module.time, "monotonic", lambda: 2.0)
+    monkeypatch.setattr(
+        commentary_module,
+        "capture_client",
+        lambda *args, **kwargs: image,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_recognize_capture",
+        lambda *args, **kwargs: "最後に取得した本文",
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "wait_for_advance_marker",
+        lambda *args, **kwargs: pytest.fail("マーク待機は行わない"),
+    )
+    args = commentary_module._build_parser().parse_args([])
+
+    text, marker = commentary_module._capture_and_ocr(
+        object(),
+        tmp_path,
+        args,
+        object(),
+        hard_deadline=1.0,
+        deadline_fallback_reason="capture_deadline_elapsed",
+    )
+
+    assert text == "最後に取得した本文"
+    assert marker.kind == "session_end"
+    assert marker.fallback_reason == "capture_deadline_elapsed"
+
+
+def test_title_memory_directory_is_safe_and_title_specific(tmp_path) -> None:
+    first = commentary_module._safe_title_memory_dir(
+        tmp_path,
+        "ゲーム:第一章",
+    )
+    second = commentary_module._safe_title_memory_dir(
+        tmp_path,
+        "ゲーム?第一章",
+    )
+
+    assert first.parent == tmp_path
+    assert ":" not in first.name
+    assert "?" not in second.name
+    assert first != second
+
+
+def test_session_and_overall_memories_are_created_and_updated(tmp_path) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    memory_dir = tmp_path / "memory"
+    phases: list[str] = []
+
+    class FakePlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            phase = kwargs["phase"]
+            phases.append(phase)
+            if phase == "session_memory":
+                payload = {
+                    "summary": "雪山の宿へ向かい、気になる人物と出会った。",
+                    "key_events": ["雪山の宿へ到着した"],
+                    "characters": ["透: 主人公"],
+                    "important_choices": [],
+                    "unresolved_threads": ["宿で何が起きるのか"],
+                    "commentator_impression": "穏やかな導入の裏が気になる。",
+                    "next_start_point": "宿へ入る直前から再開する。",
+                }
+            else:
+                assert phase == "overall_memory"
+                payload = {
+                    "story_summary": "透は雪山の宿へ向かった。",
+                    "characters": ["透: 主人公"],
+                    "important_choices": [],
+                    "unresolved_threads": ["宿で何が起きるのか"],
+                    "current_state": "宿へ入る直前。",
+                    "commentator_perspective": "穏やかな導入の裏を疑っている。",
+                    "next_start_point": "宿へ入る場面から再開する。",
+                }
+            return TextResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                response_id=f"{phase}-response",
+            )
+
+    records = [{"turn": "turn_001", "game_text": "雪山の宿が見えた。"}]
+    for _ in range(2):
+        commentary_module._create_session_memories(
+            planner=FakePlanner(),
+            root=root,
+            memory_dir=memory_dir,
+            title="かまいたちの夜",
+            summary_model="gpt-5.6-luna",
+            termination_reason="duration_breakpoint",
+            elapsed_seconds=1_205.0,
+            records=records,
+        )
+
+    session_memory = json.loads(
+        (root / "session_memory.json").read_text(encoding="utf-8")
+    )
+    overall_path = (
+        commentary_module._safe_title_memory_dir(
+            memory_dir,
+            "かまいたちの夜",
+        )
+        / "overall.json"
+    )
+    overall_memory = json.loads(overall_path.read_text(encoding="utf-8"))
+
+    assert phases == [
+        "session_memory",
+        "overall_memory",
+        "session_memory",
+        "overall_memory",
+    ]
+    assert session_memory["turn_count"] == 1
+    assert overall_memory["session_count"] == 2
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_memory_failure_saves_pending_source_without_raising(tmp_path) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+
+    class FailingPlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            raise RuntimeError("一時的なAPI障害")
+
+    commentary_module._create_session_memories(
+        planner=FailingPlanner(),
+        root=root,
+        memory_dir=tmp_path / "memory",
+        title="かまいたちの夜",
+        summary_model="gpt-5.6-luna",
+        termination_reason="duration_breakpoint",
+        elapsed_seconds=1_205.0,
+        records=[{"turn": "turn_001", "game_text": "雪が降っていた。"}],
+    )
+
+    pending = json.loads(
+        (root / "session_memory_pending.json").read_text(encoding="utf-8")
+    )
+    assert pending["session_records"][0]["game_text"] == "雪が降っていた。"
+    assert len(pending["generation_errors"]) == 2
+    assert not (root / "session_memory.json").exists()
+
+
+def test_invalid_existing_overall_memory_is_preserved(
+    tmp_path,
+) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    memory_dir = tmp_path / "memory"
+    overall_path = (
+        commentary_module._safe_title_memory_dir(
+            memory_dir,
+            "かまいたちの夜",
+        )
+        / "overall.json"
+    )
+    overall_path.parent.mkdir(parents=True)
+    overall_path.write_text("{壊れた記憶", encoding="utf-8")
+    phases: list[str] = []
+
+    class FakePlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            phase = kwargs["phase"]
+            phases.append(phase)
+            assert phase == "session_memory"
+            return TextResult(
+                text=json.dumps(
+                    {
+                        "summary": "今回のまとめ。",
+                        "key_events": [],
+                        "characters": [],
+                        "important_choices": [],
+                        "unresolved_threads": [],
+                        "commentator_impression": "続きが気になる。",
+                        "next_start_point": "現在の画面から再開する。",
+                    },
+                    ensure_ascii=False,
+                ),
+                response_id="session-memory-response",
+            )
+
+    commentary_module._create_session_memories(
+        planner=FakePlanner(),
+        root=root,
+        memory_dir=memory_dir,
+        title="かまいたちの夜",
+        summary_model="gpt-5.6-luna",
+        termination_reason="duration_breakpoint",
+        elapsed_seconds=1_205.0,
+        records=[{"turn": "turn_001", "game_text": "本文"}],
+    )
+
+    assert phases == ["session_memory"]
+    assert overall_path.read_text(encoding="utf-8") == "{壊れた記憶"
+    assert (root / "overall_memory_pending.json").exists()
+
+
+def test_sleep_with_deadline_caps_long_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 10.0
+    slept: list[float] = []
+
+    def fake_monotonic() -> float:
+        return clock
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal clock
+        slept.append(seconds)
+        clock += seconds
+
+    monkeypatch.setattr(commentary_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(commentary_module.time, "sleep", fake_sleep)
+
+    assert commentary_module._sleep_with_deadline(30.0, 12.5) is True
+    assert slept == [2.5]
+
+
+def test_choice_speech_retry_is_bounded_by_session_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class FakeRealtime:
+        def speak(self, **kwargs) -> SpeechResult:
+            return SpeechResult(
+                phase="choice",
+                transcript="まったく違う発話です。",
+                audio_bytes=100,
+                response_id="choice-response",
+            )
+
+    monkeypatch.setattr(commentary_module.time, "monotonic", lambda: 10.0)
+    plan = ChoicePlan(
+        selected_label="B",
+        opinion="こちらの展開を見てみたいよね。",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+
+    with pytest.raises(commentary_module.SessionEndingRequested) as raised:
+        speak_choice_with_retries(
+            FakeRealtime(),
+            plan,
+            turn_dir=tmp_path,
+            playback=False,
+            retries=0,
+            retry_delay=0.0,
+            hard_deadline=5.0,
+        )
+
+    assert raised.value.retry_count == 0
+    assert raised.value.verification.matches is False
+
+
+def test_timed_book_ending_does_not_press_enter_and_creates_memories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+    source_text = "ここで物語が大きく動いた。"
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            assert enabled is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeOcr:
+        initialization_seconds = 0.0
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            phase = kwargs["phase"]
+            events.append(phase)
+            transcript = (
+                source_text
+                if phase == "narration"
+                else "締めの発話"
+                if phase == "closing"
+                else "ここまで一気に話が動いて驚いたよね。"
+            )
+            return SpeechResult(
+                phase=phase,
+                transcript=transcript,
+                audio_bytes=100,
+                response_id=f"{phase}-response",
+                started_at_seconds=1.0,
+                ended_at_seconds=2.0,
+            )
+
+    class FakePlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def generate_text(self, **kwargs) -> TextResult:
+            phase = kwargs["phase"]
+            if phase == "commentary_plan":
+                payload = {
+                    "mode": "quick",
+                    "comment": (
+                        "ここまで一気に話が動いて、かなり驚いたよね。"
+                        "まだ先に何が待っているのか、すごく気になるかも。"
+                    ),
+                    "emotion": "surprised",
+                    "intensity": 0.7,
+                    "pace": "normal",
+                }
+            elif phase == "closing_plan":
+                payload = {
+                    "ending_line": (
+                        "ちょうど区切りがいいので、今日はこの辺で"
+                        "終わっておきましょうか。"
+                    ),
+                    "session_impression": (
+                        "思いがけない展開が続いて、この先がますます"
+                        "気になってきました。"
+                    ),
+                    "call_to_action": (
+                        "動画を気に入ってくれたら、チャンネル登録と高評価を"
+                        "お願いします。それでは、また次回！"
+                    ),
+                    "emotion": "thoughtful",
+                    "intensity": 0.7,
+                    "pace": "normal",
+                }
+            elif phase == "session_memory":
+                payload = {
+                    "summary": "物語が大きく動いた。",
+                    "key_events": ["物語が大きく動いた"],
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": ["次の展開"],
+                    "commentator_impression": "続きが気になる。",
+                    "next_start_point": "現在の画面から再開する。",
+                }
+            else:
+                assert phase == "overall_memory"
+                payload = {
+                    "story_summary": "物語が大きく動いた。",
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": ["次の展開"],
+                    "current_state": "区切りの画面。",
+                    "commentator_perspective": "続きが気になる。",
+                    "next_start_point": "現在の画面から再開する。",
+                }
+            return TextResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                response_id=f"{phase}-response",
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FakePlanner,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_capture_and_ocr",
+        lambda *args, **kwargs: (
+            source_text,
+            commentary_module.AdvanceMarker("book", 1.0, None),
+        ),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_session_stop_reason",
+        lambda **kwargs: "duration_breakpoint",
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "press_enter",
+        lambda hwnd: events.append("enter"),
+    )
+
+    result = commentary_module.main(
+        [
+            "--press-enter",
+            "--no-playback",
+            "--no-obs-window",
+            "--output",
+            str(tmp_path / "session"),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+        ]
+    )
+
+    assert result == 0
+    assert "enter" not in events
+    assert events == ["narration", "commentary", "closing"]
+    turn_result = json.loads(
+        (tmp_path / "session" / "turn_001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert turn_result["enter_pressed"] is False
+    assert turn_result["enter_blocked_reason"] == "session_ending"
+    assert (tmp_path / "session" / "closing_plan.json").exists()
+    assert (tmp_path / "session" / "session_memory.json").exists()
+
+
+def test_timed_choice_ending_does_not_plan_or_perform_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source_text = "どちらへ行く？\nA: 食堂\nB: 客室"
+    phases: list[str] = []
+    selections: list[int] = []
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeOcr:
+        initialization_seconds = 0.0
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            phase = kwargs["phase"]
+            phases.append(phase)
+            return SpeechResult(
+                phase=phase,
+                transcript=source_text if phase == "narration" else "締め",
+                audio_bytes=100,
+                response_id=f"{phase}-response",
+                started_at_seconds=1.0,
+                ended_at_seconds=2.0,
+            )
+
+    class FakePlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def generate_text(self, **kwargs) -> TextResult:
+            phase = kwargs["phase"]
+            assert not phase.startswith("choice_plan")
+            if phase == "closing_plan":
+                payload = {
+                    "ending_line": "選択肢が出たところで、今日はこの辺にしましょうか。",
+                    "session_impression": (
+                        "どちらへ進むか、次回までゆっくり考えるのも楽しそうですね。"
+                    ),
+                    "call_to_action": (
+                        "動画を気に入ってくれたら、チャンネル登録と高評価を"
+                        "お願いします。それでは、また次回！"
+                    ),
+                    "emotion": "thoughtful",
+                    "intensity": 0.65,
+                    "pace": "normal",
+                }
+            elif phase == "session_memory":
+                payload = {
+                    "summary": "食堂か客室かを選ぶ場面まで進んだ。",
+                    "key_events": ["選択肢が表示された"],
+                    "characters": [],
+                    "important_choices": ["食堂か客室かは未選択"],
+                    "unresolved_threads": ["どちらへ進むか"],
+                    "commentator_impression": "次回まで考えたい。",
+                    "next_start_point": "未選択の画面から再開する。",
+                }
+            else:
+                assert phase == "overall_memory"
+                payload = {
+                    "story_summary": "移動先を選ぶところまで進んだ。",
+                    "characters": [],
+                    "important_choices": ["食堂か客室かは未選択"],
+                    "unresolved_threads": ["どちらへ進むか"],
+                    "current_state": "選択肢を表示中。",
+                    "commentator_perspective": "次回まで考えたい。",
+                    "next_start_point": "未選択の画面から再開する。",
+                }
+            return TextResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                response_id=f"{phase}-response",
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FakePlanner,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_capture_and_ocr",
+        lambda *args, **kwargs: (
+            source_text,
+            commentary_module.AdvanceMarker("choices", 1.0, None),
+        ),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_session_stop_reason",
+        lambda **kwargs: "duration_breakpoint",
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "select_choice",
+        lambda hwnd, index: selections.append(index),
+    )
+
+    result = commentary_module.main(
+        [
+            "--press-enter",
+            "--no-playback",
+            "--no-obs-window",
+            "--output",
+            str(tmp_path / "session"),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+        ]
+    )
+
+    assert result == 0
+    assert selections == []
+    assert phases == ["narration", "closing"]
+    turn_result = json.loads(
+        (tmp_path / "session" / "turn_001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert turn_result["choice_plan"] is None
+    assert turn_result["selection_performed"] is False
+
+
+def test_summary_client_start_failure_still_speaks_fallback_closing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source_text = "ここで一区切り。"
+    phases: list[str] = []
+
+    class FakeObsWindow:
+        error = None
+        is_open = False
+
+        def __init__(self, *, enabled: bool) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+    class FakeOcr:
+        initialization_seconds = 0.0
+
+    class FakeRealtimeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            pass
+
+        def speak(self, **kwargs) -> SpeechResult:
+            phase = kwargs["phase"]
+            phases.append(phase)
+            return SpeechResult(
+                phase=phase,
+                transcript=(
+                    source_text if phase == "narration" else "定型の締め"
+                ),
+                audio_bytes=100,
+                response_id=f"{phase}-response",
+                started_at_seconds=1.0,
+                ended_at_seconds=2.0,
+            )
+
+    class FailingPlanner:
+        def __init__(self, **kwargs) -> None:
+            raise OSError("クライアント初期化失敗")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(commentary_module, "ObsCaptureWindow", FakeObsWindow)
+    monkeypatch.setattr(commentary_module, "PersistentNdlOcr", FakeOcr)
+    monkeypatch.setattr(
+        commentary_module,
+        "RealtimeSpeechClient",
+        FakeRealtimeClient,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "ResponsesCommentaryPlanner",
+        FailingPlanner,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "find_window",
+        lambda title: commentary_module.WindowInfo(123, title, 960, 540),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_capture_and_ocr",
+        lambda *args, **kwargs: (
+            source_text,
+            commentary_module.AdvanceMarker("book", 1.0, None),
+        ),
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_session_stop_reason",
+        lambda **kwargs: "duration_breakpoint",
+    )
+
+    root = tmp_path / "session"
+    result = commentary_module.main(
+        [
+            "--press-enter",
+            "--narration-only",
+            "--no-playback",
+            "--no-obs-window",
+            "--output",
+            str(root),
+            "--memory-dir",
+            str(tmp_path / "memory"),
+        ]
+    )
+
+    assert result == 0
+    assert phases == ["narration", "closing"]
+    closing_plan = json.loads(
+        (root / "closing_plan.json").read_text(encoding="utf-8")
+    )
+    assert closing_plan["fallback_used"] is True
+    assert (root / "session_memory_pending.json").exists()
 
 
 def test_clean_ocr_text_strips_page_cursor_attached_to_last_line(tmp_path) -> None:
