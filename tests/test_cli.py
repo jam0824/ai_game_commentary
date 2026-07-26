@@ -77,6 +77,36 @@ def test_obs_capture_window_can_be_disabled() -> None:
     assert args.no_obs_window is True
 
 
+def test_commentary_config_is_loaded_and_cli_takes_precedence(tmp_path) -> None:
+    config_path = tmp_path / "commentary.toml"
+    config_path.write_text(
+        "ocr_interval = 0.75\n"
+        "stable_ocr_samples = 4\n",
+        encoding="utf-8",
+    )
+
+    configured = commentary_module._parse_args(
+        ["--config", str(config_path)]
+    )
+    overridden = commentary_module._parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--ocr-interval",
+            "0.25",
+        ]
+    )
+
+    assert configured.ocr_interval == pytest.approx(0.75)
+    assert configured.stable_ocr_samples == 4
+    assert overridden.ocr_interval == pytest.approx(0.25)
+
+
+def test_default_ocr_interval_is_half_a_second() -> None:
+    args = commentary_module._build_parser().parse_args([])
+    assert args.ocr_interval == pytest.approx(0.5)
+
+
 def test_obs_capture_window_opens_before_ocr_initialization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -166,6 +196,8 @@ def test_narration_prompt_wraps_source_as_verbatim_json() -> None:
     prompt = build_narration_prompt("ぼくの名前は、透。")
     assert '"response_text": "ぼくの名前は、透。"' in prompt
     assert '"require_repeat_verbatim": true' in prompt
+    assert "先頭文字から直ちに始め" in prompt
+    assert "『はい』『では』『じゃあ』『読み上げます』" in prompt
 
 
 def test_narration_prompt_collapses_visual_line_wraps() -> None:
@@ -1057,6 +1089,7 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
     source_text = "文字表示が完了した。"
     image = Image.new("RGB", (960, 540), "black")
     wait_calls = 0
+    wait_timeouts: list[float] = []
 
     class FakeObsWindow:
         error = None
@@ -1088,7 +1121,7 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
             events.append("narration")
             return SpeechResult(
                 phase="narration",
-                transcript=source_text,
+                transcript="本文とは異なる転写。",
                 audio_bytes=100,
                 response_id="narration-response",
             )
@@ -1096,6 +1129,7 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
     def fake_wait(*args, **kwargs):
         nonlocal wait_calls
         wait_calls += 1
+        wait_timeouts.append(kwargs["timeout"])
         return (
             image,
             commentary_module.AdvanceMarker(
@@ -1150,13 +1184,16 @@ def test_main_stable_text_fallback_sends_enter_once_after_narration(
 
     assert result == 0
     assert wait_calls == commentary_module.STABLE_OCR_REQUIRED_SAMPLES
+    assert wait_timeouts == [0.5, 0.5, 0.5]
     assert events == ["narration", "enter"]
     summary = json.loads(
         (tmp_path / "turn_001" / "result.json").read_text(encoding="utf-8")
     )
     assert summary["advance_marker"]["kind"] == "book"
     assert summary["advance_marker"]["fallback_reason"] == "stable_ocr"
+    assert summary["narration_matches"] is False
     assert summary["enter_pressed"] is True
+    assert summary["enter_blocked_reason"] is None
 
 
 def test_marker_wait_retries_after_timeout(
@@ -1625,6 +1662,19 @@ def test_narration_match_ignores_spaces_and_punctuation() -> None:
         "ぼくの名前は透 東京の大学に通う学生だ",
     )
     assert not narration_matches("透です。", "真理です。")
+
+
+def test_narration_match_accepts_preface_when_full_source_is_spoken() -> None:
+    source = (
+        "「なかなかいいですよ。リフトもそんなに混んでないし」"
+        "可奈子ちゃんも真理に負けず劣らずスキー好きなのか。"
+    )
+    transcript = (
+        "じゃあ、そのままの内容を自然に読み上げます。"
+        + source
+    )
+
+    assert narration_matches(source, transcript)
 
 
 def test_narration_match_accepts_good_orthographic_variation() -> None:

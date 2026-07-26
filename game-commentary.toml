@@ -1,0 +1,30 @@
+# AIゲーム実況の通常設定です。
+# 同じ項目をコマンドラインで指定した場合は、コマンドラインを優先します。
+
+title = "かまいたちの夜"
+model = "gpt-realtime-2.1-mini"
+commentary_model = "gpt-5.6-luna"
+voice = "marin"
+
+scale = 2.0
+min_confidence = 0.5
+max_turns = 1
+
+speech_retries = 0
+speech_retry_delay = 0.5
+after_enter_delay = 1.0
+
+# 文字送りマークが見つからない間にOCRを再確認する間隔。
+ocr_interval = 0.5
+# 空白を除いたOCR本文がこの回数連続で一致すると表示完了とみなす。
+stable_ocr_samples = 3
+# 安定本文で確定するとき、弱く検出した進行マークの種類を採用するしきい値。
+stable_marker_candidate_score = 0.60
+
+marker_timeout = 12.0
+marker_retries = 0
+marker_retry_delay = 1.0
+marker_poll_interval = 0.15
+marker_threshold = 0.78
+
+timeout = 120.0

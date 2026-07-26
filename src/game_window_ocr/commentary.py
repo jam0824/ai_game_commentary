@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import tomllib
 import unicodedata
 import wave
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -55,13 +56,35 @@ FUZZY_PREFIX_MIN_COVERAGE = 0.8
 FUZZY_PREFIX_MAX_ERROR_RATE = 0.12
 COMMENTARY_PLAN_REVISIONS = 3
 CHOICE_PLAN_REVISIONS = 3
-CHOICE_PROBE_INTERVAL = 1.0
+OCR_INTERVAL = 0.5
 CHOICE_SPEECH_SIMILARITY_THRESHOLD = 0.88
 MARKER_REFERENCE_SIZE = (960, 540)
 MARKER_MATCH_THRESHOLD = 0.78
 TRIANGLE_CONTOUR_SCORE = 0.90
 STABLE_OCR_REQUIRED_SAMPLES = 3
 STABLE_MARKER_CANDIDATE_SCORE = 0.60
+DEFAULT_CONFIG_PATH = Path("game-commentary.toml")
+DEFAULT_CONFIG_VALUES: dict[str, str | int | float] = {
+    "title": DEFAULT_TITLE,
+    "model": DEFAULT_MODEL,
+    "commentary_model": DEFAULT_COMMENTARY_MODEL,
+    "voice": DEFAULT_VOICE,
+    "scale": 2.0,
+    "min_confidence": 0.5,
+    "max_turns": 1,
+    "speech_retries": 0,
+    "speech_retry_delay": 0.5,
+    "after_enter_delay": 1.0,
+    "ocr_interval": OCR_INTERVAL,
+    "stable_ocr_samples": STABLE_OCR_REQUIRED_SAMPLES,
+    "stable_marker_candidate_score": STABLE_MARKER_CANDIDATE_SCORE,
+    "marker_timeout": 12.0,
+    "marker_retries": 0,
+    "marker_retry_delay": 1.0,
+    "marker_poll_interval": 0.15,
+    "marker_threshold": MARKER_MATCH_THRESHOLD,
+    "timeout": 120.0,
+}
 
 COMMENTARY_PLANNER_INSTRUCTIONS = (
     "あなたは初見プレイ中の日本語ゲーム実況プランナーです。"
@@ -707,6 +730,8 @@ def build_narration_prompt(text: str) -> str:
         "次のJSONだけを処理してください。\n"
         "- require_repeat_verbatim が true の場合、response_text の語句を"
         "追加・省略・言い換え・訂正せず、自然な日本語で読み上げる。\n"
+        "- 音声はresponse_textの先頭文字から直ちに始め、末尾で終了する。"
+        "『はい』『では』『じゃあ』『読み上げます』などを前後に付けない。\n"
         "- 句読点は間として扱い、記号名として発音しない。\n"
         "- 前置き、感想、説明、見出しを一切加えない。\n"
         "- OCRの誤りらしく見えても勝手に直さない。\n\n"
@@ -1184,8 +1209,11 @@ def normalize_spoken_variants(text: str) -> str:
 
 
 def narration_matches(source: str, transcript: str) -> bool:
-    return normalize_spoken_variants(source) == normalize_spoken_variants(
-        transcript
+    normalized_source = normalize_spoken_variants(source)
+    normalized_transcript = normalize_spoken_variants(transcript)
+    return bool(normalized_source) and (
+        normalized_source == normalized_transcript
+        or normalized_source in normalized_transcript
     )
 
 
@@ -1660,31 +1688,98 @@ def speak_choice_with_retries(
         time.sleep(retry_delay)
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _load_config(path: Path) -> dict[str, str | int | float]:
+    with path.open("rb") as config_file:
+        payload = tomllib.load(config_file)
+    if not isinstance(payload, dict):
+        raise ValueError("設定ファイルのトップレベルはテーブルにしてください。")
+
+    unknown_keys = sorted(set(payload) - set(DEFAULT_CONFIG_VALUES))
+    if unknown_keys:
+        raise ValueError(
+            "設定ファイルに未対応の項目があります: "
+            + ", ".join(unknown_keys)
+        )
+
+    values: dict[str, str | int | float] = {}
+    for key, value in payload.items():
+        default = DEFAULT_CONFIG_VALUES[key]
+        if isinstance(default, str):
+            valid = isinstance(value, str)
+        elif isinstance(default, int):
+            valid = isinstance(value, int) and not isinstance(value, bool)
+        else:
+            valid = (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            )
+        if not valid:
+            raise ValueError(
+                f"設定ファイルの {key} の型が正しくありません。"
+            )
+        values[key] = float(value) if isinstance(default, float) else value
+    return values
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    config_probe = argparse.ArgumentParser(add_help=False)
+    config_probe.add_argument("--config", type=Path)
+    config_args, _unknown = config_probe.parse_known_args(argv)
+    config_path = config_args.config or DEFAULT_CONFIG_PATH
+
+    config_values: dict[str, str | int | float] = {}
+    if config_path.exists():
+        config_values = _load_config(config_path)
+    elif config_args.config is not None:
+        raise ValueError(f"設定ファイルが見つかりません: {config_path}")
+
+    return _build_parser(config_values).parse_args(argv)
+
+
+def _build_parser(
+    config_values: dict[str, str | int | float] | None = None,
+) -> argparse.ArgumentParser:
+    defaults = dict(DEFAULT_CONFIG_VALUES)
+    if config_values:
+        defaults.update(config_values)
+
     parser = argparse.ArgumentParser(
         description="OCR本文をRealtimeモデルで朗読し、短い感想を音声再生します。"
     )
-    parser.add_argument("--title", default=DEFAULT_TITLE)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
-        "--commentary-model",
-        default=DEFAULT_COMMENTARY_MODEL,
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
         help=(
-            "感想文の判断に使うResponses APIモデル。"
-            f"既定値は {DEFAULT_COMMENTARY_MODEL}。"
+            "設定ファイル。既定ではカレントディレクトリの"
+            " game-commentary.toml を読み込みます。"
         ),
     )
-    parser.add_argument("--voice", default=DEFAULT_VOICE)
+    parser.add_argument("--title", default=defaults["title"])
+    parser.add_argument("--model", default=defaults["model"])
+    parser.add_argument(
+        "--commentary-model",
+        default=defaults["commentary_model"],
+        help=(
+            "感想文の判断に使うResponses APIモデル。"
+            f"既定値は {defaults['commentary_model']}。"
+        ),
+    )
+    parser.add_argument("--voice", default=defaults["voice"])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--crop", type=parse_crop)
-    parser.add_argument("--scale", type=float, default=2.0)
-    parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--scale", type=float, default=defaults["scale"])
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=defaults["min_confidence"],
+    )
     parser.add_argument("--viz", action="store_true")
     parser.add_argument("--no-activate", action="store_true")
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=1,
+        default=defaults["max_turns"],
         help="処理する画面数。試作の既定値は1。",
     )
     parser.add_argument(
@@ -1699,14 +1794,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-narration-mismatch",
         action="store_true",
         help=(
-            "朗読または選択発話の転写が予定文と一致しなくても"
-            "キー入力を許可します（非推奨）。"
+            "選択発話の転写が予定文と一致しなくても"
+            "選択キー入力を許可します（非推奨）。"
+            "通常朗読の不一致は常に警告のみで進行します。"
         ),
     )
     parser.add_argument(
         "--speech-retries",
         type=int,
-        default=0,
+        default=defaults["speech_retries"],
         help=(
             "選択発話の確認失敗時に再試行する回数。"
             "0（既定値）は成功するまで無制限。"
@@ -1715,7 +1811,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--speech-retry-delay",
         type=float,
-        default=0.5,
+        default=defaults["speech_retry_delay"],
         help="選択発話を再試行するまでの秒数。",
     )
     parser.add_argument(
@@ -1736,40 +1832,58 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--after-enter-delay",
         type=float,
-        default=1.0,
+        default=defaults["after_enter_delay"],
         help="Enter送信後、次のキャプチャまで待つ秒数。",
+    )
+    parser.add_argument(
+        "--ocr-interval",
+        type=float,
+        default=defaults["ocr_interval"],
+        help="進行マーク未検出時にOCRを再確認する間隔（秒）。",
+    )
+    parser.add_argument(
+        "--stable-ocr-samples",
+        type=int,
+        default=defaults["stable_ocr_samples"],
+        help="同一OCR本文を表示完了とみなす連続回数。",
+    )
+    parser.add_argument(
+        "--stable-marker-candidate-score",
+        type=float,
+        default=defaults["stable_marker_candidate_score"],
+        help="安定本文確定時に三角・本マークの種類を採用する最低一致度。",
     )
     parser.add_argument(
         "--marker-timeout",
         type=float,
-        default=12.0,
+        default=defaults["marker_timeout"],
         help="文字送りの三角・本マークまたは選択肢を1回に待つ最大秒数。",
     )
     parser.add_argument(
         "--marker-retries",
         type=int,
-        default=0,
+        default=defaults["marker_retries"],
         help="進行待ちの検出を再試行する回数。0（既定値）は無制限。",
     )
     parser.add_argument(
         "--marker-retry-delay",
         type=float,
-        default=1.0,
+        default=defaults["marker_retry_delay"],
         help="マーク待機を再試行するまでの秒数。",
     )
     parser.add_argument(
         "--marker-poll-interval",
         type=float,
-        default=0.15,
+        default=defaults["marker_poll_interval"],
         help="文字送りマークを再確認する間隔（秒）。",
     )
     parser.add_argument(
         "--marker-threshold",
         type=float,
-        default=MARKER_MATCH_THRESHOLD,
+        default=defaults["marker_threshold"],
         help="文字送りマークの画像一致度しきい値（0.0～1.0）。",
     )
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=defaults["timeout"])
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--text", help="OCRを使わず、この文字列で音声だけ試します。")
     source.add_argument(
@@ -1835,7 +1949,7 @@ def _capture_and_ocr(
             raw, marker = wait_for_advance_marker(
                 window,
                 activate=not args.no_activate,
-                timeout=min(CHOICE_PROBE_INTERVAL, remaining),
+                timeout=min(args.ocr_interval, remaining),
                 poll_interval=args.marker_poll_interval,
                 threshold=args.marker_threshold,
             )
@@ -1876,14 +1990,15 @@ def _capture_and_ocr(
                 stable_ocr_samples = 1 if current_ocr_key else 0
 
             if (
-                stable_ocr_samples >= STABLE_OCR_REQUIRED_SAMPLES
+                stable_ocr_samples >= args.stable_ocr_samples
                 and extract_incremental_text(previous_text, text)
                 and not _contains_choice_label(text)
             ):
                 fallback_kind = "stable_text"
                 if (
                     best_marker.candidate_kind in {"triangle", "book"}
-                    and best_marker.score >= STABLE_MARKER_CANDIDATE_SCORE
+                    and best_marker.score
+                    >= args.stable_marker_candidate_score
                 ):
                     fallback_kind = best_marker.candidate_kind
                 marker = AdvanceMarker(
@@ -1967,8 +2082,13 @@ def _append_speech_subtitle(
 
 def main(argv: list[str] | None = None) -> int:
     timeline_origin = time.monotonic()
+    try:
+        args = _parse_args(argv)
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        print(f"エラー: 設定ファイルを読み込めません: {exc}", file=sys.stderr)
+        return 2
+
     enable_dpi_awareness()
-    args = _build_parser().parse_args(argv)
     if args.max_turns < 1:
         print("エラー: --max-turns は1以上にしてください。", file=sys.stderr)
         return 2
@@ -1977,6 +2097,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.marker_timeout <= 0:
         print("エラー: --marker-timeout は0より大きくしてください。", file=sys.stderr)
+        return 2
+    if args.ocr_interval <= 0:
+        print("エラー: --ocr-interval は0より大きくしてください。", file=sys.stderr)
+        return 2
+    if args.stable_ocr_samples < 1:
+        print("エラー: --stable-ocr-samples は1以上にしてください。", file=sys.stderr)
+        return 2
+    if not 0 <= args.stable_marker_candidate_score <= 1:
+        print(
+            "エラー: --stable-marker-candidate-score は"
+            "0.0～1.0で指定してください。",
+            file=sys.stderr,
+        )
         return 2
     if args.marker_retries < 0:
         print("エラー: --marker-retries は0以上にしてください。", file=sys.stderr)
@@ -2533,14 +2666,11 @@ def main(argv: list[str] | None = None) -> int:
                     "enter_blocked_reason": None,
                 }
                 if args.press_enter:
-                    if not match and not args.allow_narration_mismatch:
-                        summary["enter_blocked_reason"] = "narration_mismatch"
-                        (turn_dir / "result.json").write_text(
-                            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-                            encoding="utf-8",
-                        )
-                        raise RuntimeError(
-                            "朗読転写が本文と一致しないため、Enterを送りませんでした。"
+                    if not match:
+                        print(
+                            "警告: 朗読転写が本文と一致しませんが、"
+                            "ゲーム進行を優先してEnterを送ります。",
+                            file=sys.stderr,
                         )
                     if window is None:
                         raise RuntimeError("Enterの送信先ウィンドウがありません。")
