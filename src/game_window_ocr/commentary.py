@@ -37,6 +37,7 @@ from .cli import (
 from .persistent_ocr import PersistentNdlOcr
 from .obs_window import OBS_WINDOW_TITLE, ObsCaptureWindow
 from .subtitles import SrtSubtitleWriter
+from .vtube import VTubeStudioController
 from .windows import (
     WindowInfo,
     capture_client,
@@ -1930,6 +1931,22 @@ def verify_choice_speech(
     )
 
 
+def _notify_vtube_emotion(
+    vtube: VTubeStudioController | None,
+    emotion: str,
+) -> None:
+    """VTubeモデルへ感情を伝える。失敗してもゲーム進行は止めない"""
+    if vtube is None:
+        return
+    try:
+        vtube.set_emotion(emotion)
+    except Exception as exc:
+        print(
+            f"警告: VTubeモデルへの感情反映に失敗しました: {exc}",
+            file=sys.stderr,
+        )
+
+
 class AudioSink:
     def __init__(
         self,
@@ -1937,6 +1954,7 @@ class AudioSink:
         *,
         playback: bool,
         defer_playback: bool = False,
+        on_playback_change: Callable[[bool], None] | None = None,
     ) -> None:
         self.path = path
         self.playback = playback
@@ -1944,6 +1962,23 @@ class AudioSink:
         self._wave: wave.Wave_write | None = None
         self._stream: Any = None
         self._playback_failed = False
+        self._on_playback_change = on_playback_change
+        self._playback_notified = False
+
+    def _notify_playback(self, playing: bool) -> None:
+        """口パク連動などの通知。失敗しても音声処理は止めない"""
+        if self._on_playback_change is None:
+            return
+        if playing == self._playback_notified:
+            return
+        self._playback_notified = playing
+        try:
+            self._on_playback_change(playing)
+        except Exception as exc:
+            print(
+                f"警告: 再生状態の通知に失敗しました: {exc}",
+                file=sys.stderr,
+            )
 
     def __enter__(self) -> AudioSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1979,6 +2014,7 @@ class AudioSink:
                 file=sys.stderr,
             )
             return False
+        self._notify_playback(True)
         return True
 
     def write(self, chunk: bytes) -> None:
@@ -1993,13 +2029,16 @@ class AudioSink:
             self._stream.write(chunk)
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            finally:
-                self._stream.close()
-        if self._wave is not None:
-            self._wave.close()
+        try:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                finally:
+                    self._stream.close()
+        finally:
+            self._notify_playback(False)
+            if self._wave is not None:
+                self._wave.close()
 
 
 class ResponsesCommentaryPlanner:
@@ -2228,12 +2267,14 @@ class RealtimeSpeechClient:
         voice: str,
         timeout: float,
         timeline_origin: float | None = None,
+        speaking_listener: Callable[[bool], None] | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.voice = voice
         self.timeout = timeout
         self.timeline_origin = timeline_origin
+        self.speaking_listener = speaking_listener
         self._ws: websocket.WebSocket | None = None
 
     def __enter__(self) -> RealtimeSpeechClient:
@@ -2327,6 +2368,7 @@ class RealtimeSpeechClient:
             wav_path,
             playback=playback,
             defer_playback=guarded_playback,
+            on_playback_change=self.speaking_listener,
         ) as sink:
             while True:
                 event = self._receive()
@@ -2721,6 +2763,13 @@ def _build_parser(
         "--no-obs-window",
         action="store_true",
         help="OBSのアプリ音声キャプチャ用ウィンドウを表示しません。",
+    )
+    parser.add_argument(
+        "--no-vtube",
+        action="store_true",
+        help=(
+            "VTube Studio連携（感情モーション・表情・口パク）を行いません。"
+        ),
     )
     parser.add_argument(
         "--after-enter-delay",
@@ -3311,6 +3360,7 @@ def _deliver_startup_message(
     generation_errors: list[str],
     response: TextResult | None,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     message = apply_ocr_replacements(message, replacements)
     startup_record = {
@@ -3340,6 +3390,7 @@ def _deliver_startup_message(
         intensity=0.6,
         pace="normal",
     )
+    _notify_vtube_emotion(vtube, plan.emotion)
     try:
         speech: SpeechResult | None = None
         speech_prompt = build_commentary_speech_prompt(
@@ -3455,6 +3506,7 @@ def _create_startup_message(
     persona: str,
     playback: bool,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     response: TextResult | None = None
     errors: list[str] = []
@@ -3500,6 +3552,7 @@ def _create_startup_message(
         generation_errors=errors,
         response=response,
         replacements=replacements,
+        vtube=vtube,
     )
 
 
@@ -3514,6 +3567,7 @@ def _deliver_closing_message(
     generation_errors: list[str],
     response: TextResult | None,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     plan = apply_closing_plan_replacements(plan, replacements)
     closing_record = {
@@ -3534,6 +3588,7 @@ def _deliver_closing_message(
         )
 
     print("締めの挨拶を再生しています...")
+    _notify_vtube_emotion(vtube, plan.emotion)
     try:
         speech = realtime.speak(
             phase="closing",
@@ -3590,6 +3645,7 @@ def _create_closing_message(
     persona: str,
     playback: bool,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     payload, response, errors = _generate_structured_with_retries(
         planner,
@@ -3624,6 +3680,7 @@ def _create_closing_message(
         generation_errors=errors,
         response=response,
         replacements=replacements,
+        vtube=vtube,
     )
 
 
@@ -3825,6 +3882,7 @@ def _finalize_timed_session(
     persona: str,
     termination_reason: str,
     session_started_at: float,
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     records = _collect_session_records(root)
     session_elapsed_seconds = max(
@@ -3841,6 +3899,7 @@ def _finalize_timed_session(
             persona=persona,
             playback=not args.no_playback,
             replacements=args.ocr_replacements,
+            vtube=vtube,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(
@@ -4056,6 +4115,14 @@ def main(argv: list[str] | None = None) -> int:
         session_started_at = _wait_for_commentary_start(obs_window)
         print(f"Realtime音声へ接続: {args.model} / voice={args.voice}")
         with ExitStack() as stack:
+            vtube: VTubeStudioController | None = None
+            if not args.no_vtube:
+                vtube = VTubeStudioController()
+                if vtube.start():
+                    stack.callback(vtube.stop)
+                else:
+                    # 接続失敗の警告はコントローラ側が表示済み。実況は継続する
+                    vtube = None
             realtime = stack.enter_context(
                 RealtimeSpeechClient(
                     api_key=api_key,
@@ -4063,6 +4130,9 @@ def main(argv: list[str] | None = None) -> int:
                     voice=args.voice,
                     timeout=args.timeout,
                     timeline_origin=session_started_at,
+                    speaking_listener=(
+                        vtube.set_speaking if vtube is not None else None
+                    ),
                 )
             )
             planner: ResponsesCommentaryPlanner | None = None
@@ -4096,6 +4166,7 @@ def main(argv: list[str] | None = None) -> int:
                         persona=commentator_persona,
                         playback=not args.no_playback,
                         replacements=args.ocr_replacements,
+                        vtube=vtube,
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     print(
@@ -4577,6 +4648,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"意見: {choice_plan.opinion}"
                     )
                     print("意見と選択宣言を再生しています...")
+                    _notify_vtube_emotion(vtube, choice_plan.emotion)
                     choice_retry_ended_session = False
                     choice_termination_reason: str | None = None
                     try:
@@ -4929,6 +5001,7 @@ def main(argv: list[str] | None = None) -> int:
                         print("このターンは感想なしで進めます。")
                     else:
                         print("実況反応を演技付きで再生しています...")
+                        _notify_vtube_emotion(vtube, commentary_plan.emotion)
                         commentary = realtime.speak(
                             phase="commentary",
                             instructions=build_commentary_speech_prompt(
@@ -5062,6 +5135,7 @@ def main(argv: list[str] | None = None) -> int:
                         generation_errors=[str(exc)],
                         response=None,
                         replacements=args.ocr_replacements,
+                        vtube=vtube,
                     )
                     try:
                         _write_json_atomic(
@@ -5097,6 +5171,7 @@ def main(argv: list[str] | None = None) -> int:
                             persona=commentator_persona,
                             termination_reason=termination_reason,
                             session_started_at=session_started_at,
+                            vtube=vtube,
                         )
                     except (OSError, RuntimeError, ValueError) as exc:
                         print(

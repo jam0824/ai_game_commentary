@@ -459,3 +459,167 @@ def test_responses_planner_uses_choice_schema_for_choice_phase() -> None:
     response_format = client.requests[0]["json"]["text"]["format"]
     assert response_format["name"] == "choice_plan"
     assert "selected_label" in response_format["schema"]["required"]
+
+
+class _FakeOutputStream:
+    def __init__(self, **kwargs) -> None:
+        self.written: list[bytes] = []
+        self.stopped = False
+        self.closed = False
+
+    def start(self) -> None:
+        pass
+
+    def write(self, chunk: bytes) -> None:
+        self.written.append(chunk)
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _install_fake_sounddevice(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    fake = types.SimpleNamespace(RawOutputStream=_FakeOutputStream)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake)
+
+
+def test_audio_sink_notifies_playback_start_and_end(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """再生開始でTrue、再生終了でFalseを通知する（口パク連動用）"""
+    _install_fake_sounddevice(monkeypatch)
+    events: list[bool] = []
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=True,
+        on_playback_change=events.append,
+    ) as sink:
+        sink.write(b"\x00\x00")
+        assert events == [True]
+    assert events == [True, False]
+
+
+def test_audio_sink_without_playback_never_notifies(tmp_path) -> None:
+    """playback=False（WAV保存のみ）では口パク通知をしない"""
+    events: list[bool] = []
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=False,
+        on_playback_change=events.append,
+    ) as sink:
+        sink.write(b"\x00\x00")
+    assert events == []
+
+
+def test_audio_sink_deferred_playback_notifies_on_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """遅延再生（開始挨拶ガード）でもstart_playback時に通知する"""
+    _install_fake_sounddevice(monkeypatch)
+    events: list[bool] = []
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=True,
+        defer_playback=True,
+        on_playback_change=events.append,
+    ) as sink:
+        sink.write(b"\x00\x00")
+        assert events == []
+        assert sink.start_playback() is True
+        assert events == [True]
+    assert events == [True, False]
+
+
+def test_audio_sink_survives_listener_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """通知コールバックの例外で音声保存・再生を止めない"""
+    _install_fake_sounddevice(monkeypatch)
+
+    def broken_listener(_speaking: bool) -> None:
+        raise RuntimeError("listener failure")
+
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=True,
+        on_playback_change=broken_listener,
+    ) as sink:
+        sink.write(b"\x00\x00")
+    assert (tmp_path / "speech.wav").exists()
+
+
+def test_audio_sink_no_end_notification_when_stream_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """音声デバイスを開けなかったときはTrue/Falseどちらも通知しない"""
+    import sys
+    import types
+
+    class _BrokenStream:
+        def __init__(self, **kwargs) -> None:
+            raise RuntimeError("device unavailable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        types.SimpleNamespace(RawOutputStream=_BrokenStream),
+    )
+    events: list[bool] = []
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=True,
+        on_playback_change=events.append,
+    ) as sink:
+        sink.write(b"\x00\x00")
+    assert events == []
+
+
+def test_speak_notifies_speaking_listener(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """発話の再生中だけspeaking_listenerがTrueになる（配線テスト）"""
+    _install_fake_sounddevice(monkeypatch)
+    events: list[bool] = []
+    client = RealtimeSpeechClient(
+        api_key="test-key",
+        model="gpt-realtime-2.1-mini",
+        voice="marin",
+        timeout=1,
+        speaking_listener=events.append,
+    )
+    audio = base64.b64encode(b"\x00" * 480).decode("ascii")
+    responses = iter(
+        [
+            {"type": "response.output_audio.delta", "delta": audio},
+            {
+                "type": "response.output_audio_transcript.delta",
+                "delta": "こんにちは",
+            },
+            {
+                "type": "response.done",
+                "response": {"id": "response-1", "status": "completed"},
+            },
+        ]
+    )
+    client._send = lambda event: None  # type: ignore[method-assign]
+    client._receive = lambda: next(responses)  # type: ignore[method-assign]
+
+    result = client.speak(
+        phase="commentary",
+        instructions="話す",
+        wav_path=tmp_path / "commentary.wav",
+        playback=True,
+    )
+
+    assert result.transcript == "こんにちは"
+    assert events == [True, False]
