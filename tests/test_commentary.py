@@ -517,11 +517,46 @@ def test_audio_sink_without_playback_never_notifies(tmp_path) -> None:
     assert events == []
 
 
-def test_audio_sink_deferred_playback_notifies_on_start(
+def test_audio_sink_does_not_notify_before_audio_arrives(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    """遅延再生（開始挨拶ガード）でもstart_playback時に通知する"""
+    """音声デバイスを開いただけでは通知しない（まだ音は鳴っていない）"""
+    _install_fake_sounddevice(monkeypatch)
+    events: list[bool] = []
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=True,
+        on_playback_change=events.append,
+    ) as sink:
+        assert events == [], "最初の音声が届く前に再生開始を通知しています"
+        sink.write(b"\x00\x00")
+        assert events == [True]
+    assert events == [True, False]
+
+
+def test_audio_sink_ignores_empty_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """空チャンクでは再生開始を通知しない"""
+    _install_fake_sounddevice(monkeypatch)
+    events: list[bool] = []
+    with commentary_module.AudioSink(
+        tmp_path / "speech.wav",
+        playback=True,
+        on_playback_change=events.append,
+    ) as sink:
+        sink.write(b"")
+        assert events == []
+    assert events == []
+
+
+def test_audio_sink_deferred_playback_notifies_when_buffer_plays(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """遅延再生（開始挨拶ガード）では貯めた音を流した時点で通知する"""
     _install_fake_sounddevice(monkeypatch)
     events: list[bool] = []
     with commentary_module.AudioSink(
@@ -533,6 +568,8 @@ def test_audio_sink_deferred_playback_notifies_on_start(
         sink.write(b"\x00\x00")
         assert events == []
         assert sink.start_playback() is True
+        assert events == [], "デバイスを開いた時点ではまだ音が出ていません"
+        sink.play_buffered(b"\x00\x00")
         assert events == [True]
     assert events == [True, False]
 
@@ -622,4 +659,61 @@ def test_speak_notifies_speaking_listener(
     )
 
     assert result.transcript == "こんにちは"
+    assert events == [True, False]
+
+
+def test_speak_keeps_mouth_closed_until_first_audio(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """モデルが音声を返し始めるまで口パクを開始しない（配線テスト）"""
+    _install_fake_sounddevice(monkeypatch)
+    events: list[bool] = []
+    client = RealtimeSpeechClient(
+        api_key="test-key",
+        model="gpt-realtime-2.1-mini",
+        voice="marin",
+        timeout=1,
+        speaking_listener=events.append,
+    )
+    # 音声が届く前にサーバーが返す前置きイベント。この間は無音なので口を閉じたままにする
+    silent_events = [
+        {"type": "response.created", "response": {"id": "response-1"}},
+        {"type": "rate_limits.updated", "rate_limits": []},
+        {"type": "response.output_item.added", "item": {}},
+    ]
+    observed_during_silence: list[list[bool]] = []
+    stream = iter(
+        silent_events
+        + [
+            {
+                "type": "response.output_audio.delta",
+                "delta": base64.b64encode(b"\x00" * 480).decode("ascii"),
+            },
+            {
+                "type": "response.done",
+                "response": {"id": "response-1", "status": "completed"},
+            },
+        ]
+    )
+
+    def receive():
+        event = next(stream)
+        if event in silent_events:
+            observed_during_silence.append(list(events))
+        return event
+
+    client._send = lambda event: None  # type: ignore[method-assign]
+    client._receive = receive  # type: ignore[method-assign]
+
+    client.speak(
+        phase="commentary",
+        instructions="話す",
+        wav_path=tmp_path / "commentary.wav",
+        playback=True,
+    )
+
+    assert observed_during_silence == [[], [], []], (
+        "音声が届く前に口パクを開始しています"
+    )
     assert events == [True, False]

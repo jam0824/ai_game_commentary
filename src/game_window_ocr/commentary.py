@@ -2014,18 +2014,21 @@ class AudioSink:
                 file=sys.stderr,
             )
             return False
-        self._notify_playback(True)
         return True
 
     def write(self, chunk: bytes) -> None:
         if self._wave is None:
             raise RuntimeError("音声出力が開始されていません。")
         self._wave.writeframesraw(chunk)
-        if self._stream is not None:
+        if self._stream is not None and chunk:
+            # 通知はデバイスを開いた時ではなく最初の音を送る直前に出す。
+            # モデルが生成を始めるまでの無音の間に口が動かないようにするため
+            self._notify_playback(True)
             self._stream.write(chunk)
 
     def play_buffered(self, chunk: bytes) -> None:
         if self._stream is not None and chunk:
+            self._notify_playback(True)
             self._stream.write(chunk)
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
