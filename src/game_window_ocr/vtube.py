@@ -36,7 +36,10 @@ MOOD_BLEND_TAU = 0.9
 # 驚きバースト(一瞬だけ乗る演出)の長さと、その後元のムードへ戻るまでの時間
 SURPRISE_BURST = 0.9
 SURPRISE_HOLD = 2.0
-SURPRISE_EYE = 0.45    # 目の見開き量
+# 目の見開き量。素の開き(eye_open_base)から満開までのうち、どこまで見開くか。
+# 1.0 でピーク時に目一杯。素の開きが 1.0 だと足しても頭打ちで何も起きないため、
+# 各ムードの eye_open_base は満開より下げて余地を作ってある
+SURPRISE_EYE = 1.0
 SURPRISE_TILT = 5.0    # 首がカクッと傾く量(Z)
 SURPRISE_LIFT = 3.0    # 一瞬のけぞる量(Y)
 
@@ -74,6 +77,22 @@ LOOK_TILT_MAX = 8.0
 EYE_LEAD = 0.05
 EYE_HOLD = 0.02
 
+# 待機の揺れに対して目を逆へ回す量(前庭動眼反射)。
+# 首が揺れても視線が一点に留まって見えるようにする。大きくすると目が泳ぐ
+SWAY_EYE_COMP = 0.01
+
+# まばたき1回の各段階の長さ(秒)。ムードの速さで縮むが、下限を割らない
+BLINK_CLOSE = 0.07   # 閉じている
+BLINK_HALF = 0.04    # 半開き
+BLINK_OPEN = 0.12    # 開ききってから次へ
+MIN_BLINK_STEP = 2.0 / FPS
+
+# 感情の変化に気づくまでの間隔。待機中でもこの間隔で見に行く
+MOOD_REACT_TICK = 0.2
+
+# 感情が変わってから反応のまばたきを入れるまでの間(秒)
+REACTION_BLINK_DELAY = (0.15, 0.5)
+
 # 呼吸を流し込むための入力パラメータ名。
 # VTube Studio の既定パラメータには呼吸用が無いので、起動時にカスタム入力
 # パラメータとして自動生成する。生成しただけでは何も動かず、VTube Studio の
@@ -110,7 +129,7 @@ class MoodParams:
     blink_min: float       # まばたき間隔
     blink_max: float
     double_blink_chance: float
-    eye_open_base: float   # 目の開きの上限(1.0未満で半目)
+    eye_open_base: float   # 平常時の目の開き(1.0=満開。驚きで見開く余地を残す)
     look_range_x: float    # きょろきょろの振れ幅
     look_range_y: float
     look_bias_x: float     # 視線の基準位置オフセット(上向き/下向きなど)
@@ -165,7 +184,7 @@ MOODS = {
         sub_x=1.2, sub_y=0.8, sub_z=0.9,
         speed=1.0, tremor=0.0, breath_period=4.0, breath_depth=1.0,
         blink_min=2.0, blink_max=6.0, double_blink_chance=0.25,
-        eye_open_base=1.0,
+        eye_open_base=0.88,
         look_range_x=7.0, look_range_y=3.0,
         look_bias_x=0.0, look_bias_y=0.0,
         look_min=4.0, look_max=10.0,
@@ -178,7 +197,7 @@ MOODS = {
         sub_x=1.5, sub_y=1.2, sub_z=1.3,
         speed=1.3, tremor=0.0, breath_period=3.2, breath_depth=1.0,
         blink_min=1.5, blink_max=4.0, double_blink_chance=0.45,
-        eye_open_base=1.0,
+        eye_open_base=0.88,
         look_range_x=6.0, look_range_y=3.0,
         look_bias_x=0.0, look_bias_y=0.8,
         look_min=3.0, look_max=7.0,
@@ -191,7 +210,7 @@ MOODS = {
         sub_x=2.0, sub_y=1.6, sub_z=1.6,
         speed=1.75, tremor=0.15, breath_period=2.2, breath_depth=1.15,
         blink_min=1.0, blink_max=3.0, double_blink_chance=0.5,
-        eye_open_base=1.0,
+        eye_open_base=0.88,
         look_range_x=9.0, look_range_y=4.0,
         look_bias_x=0.0, look_bias_y=1.5,
         look_min=2.0, look_max=5.0,
@@ -204,7 +223,7 @@ MOODS = {
         sub_x=0.5, sub_y=0.4, sub_z=0.4,
         speed=0.7, tremor=0.1, breath_period=6.0, breath_depth=0.4,
         blink_min=2.5, blink_max=6.0, double_blink_chance=0.15,
-        eye_open_base=1.0,
+        eye_open_base=0.88,
         look_range_x=2.0, look_range_y=1.0,
         look_bias_x=0.0, look_bias_y=1.0,
         look_min=1.5, look_max=3.0,
@@ -218,7 +237,7 @@ MOODS = {
         sub_x=0.5, sub_y=0.35, sub_z=0.4,
         speed=0.85, tremor=0.35, breath_period=2.4, breath_depth=0.6,
         blink_min=1.5, blink_max=3.2, double_blink_chance=0.3,
-        eye_open_base=0.95,
+        eye_open_base=0.84,
         look_range_x=2.5, look_range_y=1.2,
         look_bias_x=0.0, look_bias_y=-0.5,
         look_min=3.0, look_max=6.0,
@@ -267,24 +286,64 @@ def surprise_envelope(u: float) -> float:
     return math.exp(-(u - 0.10) * 4.0)
 
 
-def eye_look_offset(head: float, residual: float) -> float:
+def eye_look_offset(head: float, residual: float, sway: float = 0.0) -> float:
     """目線のオフセット
 
     head は今の首の向き、residual は狙いに対して首がまだ向いていない残りの角度。
     人は視線を動かすとき目が先に動いて首が後から追いつくので、residual が大きい
     振り向きはじめに目を大きく振り、首が追いついたらズレを小さくする。
+    sway は待機の揺れ。人は首が揺れても視線は同じ点に留まる(前庭動眼反射)ので、
+    揺れの分だけ目を逆へ回して、一点を見ている感じを出す。
     VTS の Eye*X / Eye*Y は -1〜1 なので、はみ出さないよう丸める。
     """
-    return clamp(head * EYE_HOLD + residual * EYE_LEAD, -1.0, 1.0)
+    return clamp(
+        head * EYE_HOLD + residual * EYE_LEAD - sway * SWAY_EYE_COMP,
+        -1.0,
+        1.0,
+    )
 
 
-def vertical_gaze(head: float, residual: float) -> tuple[float, float]:
+def vertical_gaze(
+    head: float,
+    residual: float,
+    sway: float = 0.0,
+) -> tuple[float, float]:
     """上下方向の (首の角度, 目線) を返す
 
     LOOK_Y_SIGN をどちらにも同じように掛けるための入口。首だけ反転させると
     「顔は上、目は下」というちぐはぐな向きになるので、ここで揃えておく。
     """
-    return head * LOOK_Y_SIGN, eye_look_offset(head, residual) * LOOK_Y_SIGN
+    return (
+        head * LOOK_Y_SIGN,
+        eye_look_offset(head, residual, sway) * LOOK_Y_SIGN,
+    )
+
+
+def surprise_eye_bonus(params: MoodParams, strength: float) -> float:
+    """驚いたときに目を見開く量
+
+    素の開きから満開までの残りを埋める形にする。こうしておくと、半目のムード
+    (sad など)から驚いても、素の顔から驚いても、同じだけ「見開いた」に見える。
+    """
+    return (1.0 - params.eye_open_base) * SURPRISE_EYE * strength
+
+
+def eye_open_value(blink: float, params: MoodParams, bonus: float) -> float:
+    """送信する目の開き
+
+    まばたき(blink)を後から掛けるのは、驚いている最中でも目が閉じきるように
+    するため。足し算にすると見開き量のぶん閉じ残る。
+    """
+    return clamp(blink * (params.eye_open_base + bonus), 0.0, 1.0)
+
+
+def blink_phase(seconds: float, speed: float) -> float:
+    """まばたき1段階の長さ
+
+    ムードが速いほど短くするが、30fps で送っている以上、1フレームを切ると
+    まばたきが抜けたりチラついたりする。最低2フレームは持たせる。
+    """
+    return max(seconds / max(speed, 0.3), MIN_BLINK_STEP)
 
 
 def input_parameter_names(response: Any) -> set[str]:
@@ -504,7 +563,7 @@ class MoodEngine:
 
     def eye_open_bonus(self) -> float:
         """驚いた直後だけ目を見開く量"""
-        return SURPRISE_EYE * self.burst_strength()
+        return surprise_eye_bonus(self.params, self.burst_strength())
 
     def angles(self) -> tuple[float, float, float, float]:
         """この瞬間の (x, y, z, breath) を返す"""
@@ -707,6 +766,21 @@ class VTubeStudioController:
         finally:
             await vts.close()
 
+    async def wait_for_mood_change(self, seconds: float) -> bool:
+        """seconds 待つ。途中で感情が変わったら待たずに返る（戻り値: 変わったか）
+
+        待機の間隔はムードごとに最大10秒あるので、素直に眠ると「驚いたのに
+        画面を確認しにいかない」ような取りこぼしが出る。刻んで見に行く。
+        """
+        mood = self.engine.mood
+        remaining = seconds
+        while remaining > 0.0:
+            await asyncio.sleep(min(MOOD_REACT_TICK, remaining))
+            remaining -= MOOD_REACT_TICK
+            if self.engine.mood != mood:
+                return True
+        return False
+
     async def _stop_watcher(self) -> None:
         while not self._stop_requested.is_set():
             await asyncio.sleep(0.1)
@@ -870,17 +944,15 @@ class VTubeStudioController:
             # 呼吸で頭もわずかに上下させる(モデルの呼吸パラメータとは別口の味付け)
             breath_y = (breath - 0.5) * 2.0 * BREATH_TO_Y
 
-            eye = clamp(
-                self.state["eye_open"] * p.eye_open_base
-                + self.engine.eye_open_bonus(),
-                0.0,
-                1.0,
+            eye = eye_open_value(
+                self.state["eye_open"], p, self.engine.eye_open_bonus()
             )
-            # 首がまだ向いていない分(aim - cur)を目で先行させる
-            eye_x = eye_look_offset(cur_x, aim_x - cur_x)
-            # 上下は首と目の向きを揃える。揺れと呼吸は目線に乗せない
+            # 首がまだ向いていない分(aim - cur)を目で先行させ、
+            # 待機の揺れ(sway)のぶんは目を逆へ回して視線を一点に留める
+            eye_x = eye_look_offset(cur_x, aim_x - cur_x, sway_x)
+            # 上下は首と目の向きを揃える。呼吸は目線に乗せない
             # (呼吸のたびに目玉が上下すると落ち着かない)
-            look_y, eye_y = vertical_gaze(cur_y, aim_y - cur_y)
+            look_y, eye_y = vertical_gaze(cur_y, aim_y - cur_y, sway_y)
 
             params = list(FACE_PARAMS)
             values = [
@@ -910,21 +982,25 @@ class VTubeStudioController:
         """まばたきのタイミングを決めて state を書き換えるだけ"""
         while True:
             p = self.engine.params
-            await asyncio.sleep(random.uniform(p.blink_min, p.blink_max))
+            if await self.wait_for_mood_change(
+                random.uniform(p.blink_min, p.blink_max)
+            ):
+                # 感情が動いた直後は一拍おいて反応のまばたきを入れる。
+                # 変化と同時に閉じると機械的に見えるので少しずらす
+                await asyncio.sleep(random.uniform(*REACTION_BLINK_DELAY))
 
             # 落ち込み時はゆっくり、興奮時はパチパチと速く閉じる
             p = self.engine.params
-            pace = 1.0 / max(p.speed, 0.3)
 
             # たまに二連続まばたき
             count = 2 if random.random() < p.double_blink_chance else 1
             for _ in range(count):
                 self.state["eye_open"] = 0.0
-                await asyncio.sleep(0.07 * pace)
+                await asyncio.sleep(blink_phase(BLINK_CLOSE, p.speed))
                 self.state["eye_open"] = 0.5
-                await asyncio.sleep(0.04 * pace)
+                await asyncio.sleep(blink_phase(BLINK_HALF, p.speed))
                 self.state["eye_open"] = 1.0
-                await asyncio.sleep(0.12 * pace)
+                await asyncio.sleep(blink_phase(BLINK_OPEN, p.speed))
 
     async def _look_director(self) -> None:
         """たまに視線・首の向きを変える(きょろきょろ / ゲーム画面のチラ見)
@@ -934,7 +1010,11 @@ class VTubeStudioController:
         """
         while True:
             p = self.engine.params
-            await asyncio.sleep(random.uniform(p.look_min, p.look_max))
+            # 感情が変わったら待たずに視線を動かし直す。驚いた瞬間に画面を
+            # 確認しにいく動きが、次のきょろきょろまで遅れないように
+            await self.wait_for_mood_change(
+                random.uniform(p.look_min, p.look_max)
+            )
 
             if self.state["look_override"] is not None:
                 # 視線を固定中は自動のきょろきょろを出さない
@@ -945,8 +1025,9 @@ class VTubeStudioController:
             self.state["look_x"] = x
             self.state["look_y"] = y
 
-            # しばらくしたら待機位置に戻る
-            await asyncio.sleep(hold)
+            # しばらくしたら待機位置に戻る。ここでも感情が動けば見直す
+            if await self.wait_for_mood_change(hold):
+                continue
             self.state["look_x"], self.state["look_y"] = rest_look_target(
                 p, random
             )

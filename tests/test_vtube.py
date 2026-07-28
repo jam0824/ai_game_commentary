@@ -1,6 +1,9 @@
+import asyncio
 import random
 import threading
 import time
+
+import pytest
 
 from game_window_ocr import vtube
 from game_window_ocr.vtube import (
@@ -104,10 +107,117 @@ class TestEyeMotion:
 
     def test_eye_and_head_look_the_same_way_vertically(self) -> None:
         """上下の向きは首と目で一致させる（LOOK_Y_SIGNを反転しても矛盾しない）"""
-        controller = VTubeStudioController()
         head_y, eye_y = vtube.vertical_gaze(head=10.0, residual=0.0)
         assert head_y * eye_y > 0.0, "首と目が上下逆を向いています"
-        controller.stop()
+
+    def test_eyes_hold_their_point_against_the_sway(self) -> None:
+        """首が揺れても視線は同じ点に留まる（揺れと逆方向へ補正する）"""
+        still = vtube.eye_look_offset(head=0.0, residual=0.0, sway=0.0)
+        swayed = vtube.eye_look_offset(head=0.0, residual=0.0, sway=4.0)
+        assert swayed < still, "首の揺れに目線が逆補正されていません"
+
+    def test_sway_compensation_stays_subtle(self) -> None:
+        """揺れの補正は控えめ（揺れだけで目が泳がない）"""
+        widest = max(p.sway_x + p.sub_x for p in vtube.MOODS.values())
+        drift = abs(vtube.eye_look_offset(head=0.0, residual=0.0, sway=widest))
+        assert drift <= 0.1, f"揺れによる目線のブレが大きすぎます: {drift}"
+
+
+class TestEyeOpen:
+    def test_every_mood_can_widen_the_eyes_when_surprised(self) -> None:
+        """どのムードから驚いても目の見開きが見た目に出る"""
+        for name, params in vtube.MOODS.items():
+            calm_eyes = vtube.eye_open_value(1.0, params, 0.0)
+            wide_eyes = vtube.eye_open_value(
+                1.0, params, vtube.surprise_eye_bonus(params, 1.0)
+            )
+            assert wide_eyes - calm_eyes >= 0.10, (
+                f"{name}で驚いても目が見開きません: "
+                f"{calm_eyes:.2f} -> {wide_eyes:.2f}"
+            )
+
+    def test_normal_eyes_leave_room_to_widen(self) -> None:
+        """平常時の目は満開手前にして、見開く余地を残す"""
+        for name, params in vtube.MOODS.items():
+            assert params.eye_open_base < 1.0, f"{name}に見開く余地がありません"
+
+    def test_surprise_opens_the_eyes_fully(self) -> None:
+        """驚きのピークでは目一杯まで見開く"""
+        for params in vtube.MOODS.values():
+            peak = vtube.eye_open_value(
+                1.0, params, vtube.surprise_eye_bonus(params, 1.0)
+            )
+            assert peak == pytest.approx(1.0)
+
+    def test_blink_closes_the_eyes_even_while_surprised(self) -> None:
+        """驚いている最中のまばたきでも目は閉じきる"""
+        params = vtube.MOODS["calm"]
+        bonus = vtube.surprise_eye_bonus(params, 1.0)
+        assert vtube.eye_open_value(0.0, params, bonus) == 0.0
+
+    def test_eyes_return_to_normal_after_the_burst(self) -> None:
+        """驚きが収まれば元の開きへ戻る"""
+        params = vtube.MOODS["calm"]
+        assert vtube.surprise_eye_bonus(params, 0.0) == 0.0
+        assert vtube.eye_open_value(1.0, params, 0.0) == params.eye_open_base
+
+
+class TestMoodReaction:
+    """感情が変わったとき、次の待機を待たずに動きへ反映されるか"""
+
+    def test_wait_is_interrupted_by_a_mood_change(self) -> None:
+        """待機中に感情が変わったら、待たずに次の動きへ移る"""
+        controller = VTubeStudioController()
+
+        async def scenario() -> tuple[bool, float]:
+            started = time.perf_counter()
+            task = asyncio.create_task(controller.wait_for_mood_change(30.0))
+            await asyncio.sleep(0.05)
+            controller.engine.set_mood("surprised")
+            changed = await asyncio.wait_for(task, timeout=2.0)
+            return changed, time.perf_counter() - started
+
+        changed, elapsed = asyncio.run(scenario())
+        assert changed is True
+        assert elapsed < 1.0, f"感情の変化に{elapsed:.2f}秒かかっています"
+
+    def test_wait_uses_the_full_time_when_the_mood_stays(self) -> None:
+        """感情が変わらなければ指定どおり待つ"""
+        controller = VTubeStudioController()
+
+        async def scenario() -> tuple[bool, float]:
+            started = time.perf_counter()
+            changed = await controller.wait_for_mood_change(0.5)
+            return changed, time.perf_counter() - started
+
+        changed, elapsed = asyncio.run(scenario())
+        assert changed is False
+        assert elapsed >= 0.5
+
+
+class TestBlinkTiming:
+    def test_every_phase_lasts_at_least_two_frames(self) -> None:
+        """30fpsで送るので、まばたきの各段階は最低2フレーム持たせる
+
+        速いムードで1フレームを切ると、まばたきが抜けたりチラついたりする。
+        """
+        floor = 2.0 / vtube.FPS
+        for name, params in vtube.MOODS.items():
+            for seconds in (
+                vtube.BLINK_CLOSE,
+                vtube.BLINK_HALF,
+                vtube.BLINK_OPEN,
+            ):
+                phase = vtube.blink_phase(seconds, params.speed)
+                assert phase >= floor - 1e-9, (
+                    f"{name}のまばたきが速すぎます: {phase * vtube.FPS:.1f}フレーム"
+                )
+
+    def test_slow_moods_still_blink_slower(self) -> None:
+        """下限を入れても、重いムードのゆっくりしたまばたきは残る"""
+        slow = vtube.blink_phase(vtube.BLINK_OPEN, vtube.MOODS["sad"].speed)
+        quick = vtube.blink_phase(vtube.BLINK_OPEN, vtube.MOODS["excited"].speed)
+        assert slow > quick
 
 
 class _AlwaysGlanceRng:
@@ -469,6 +579,31 @@ class TestControllerIntegration:
             assert _wait_until(
                 lambda: (face_angle_x() or 0.0) > 0.0
             ), "固定を解除しても視線が戻りません"
+        finally:
+            controller.stop()
+
+    def test_gaze_reacts_to_a_new_emotion_without_waiting(self) -> None:
+        """感情が変わったら、次のきょろきょろを待たずに視線を動かし直す
+
+        calmの待機は最長10秒あるので、驚いた瞬間に画面を確認しにいく動きが
+        そこまで遅れないことを確かめる。
+        """
+        controller, fake = self._start_controller()
+        try:
+            # 待機モーションが動き出す＝各ディレクタが待機に入ってから仕掛ける
+            assert _wait_until(
+                lambda: any(
+                    request.get("messageType") == "InjectParameterDataRequest"
+                    for request in list(fake.requests)
+                )
+            )
+            sentinel = 999.0
+            controller.state["look_x"] = sentinel
+            controller.set_emotion("surprised")
+            assert _wait_until(
+                lambda: controller.state["look_x"] != sentinel,
+                timeout=2.0,
+            ), "感情が変わっても視線の狙いが更新されません"
         finally:
             controller.stop()
 
