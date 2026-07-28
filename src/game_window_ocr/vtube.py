@@ -46,6 +46,9 @@ SURPRISE_LIFT = 3.0    # 一瞬のけぞる量(Y)
 # FaceAngleY の符号。モデルによって上下が逆なら -1.0 にする
 LOOK_Y_SIGN = 1.0
 
+# 首の角度の上限。VTS の FaceAngleX/Y と、モデルの ParamAngle* が ±30 のため
+FACE_ANGLE_LIMIT = 30.0
+
 # ゲーム画面の方向。キャラは配信画面の右下に立つので、画面は「向かって左上」にある。
 # 逆を向いたら符号を反転する。
 # 配信画面ではキャラが小さく映るので、はっきり首を振らないと「画面を見た」ことが
@@ -69,6 +72,37 @@ LOOK_FOLLOW_RATE = 2.8
 LOOK_TO_TILT = 0.28
 LOOK_TILT_MAX = 8.0
 
+# 視線パターン。ムードごとに出やすいものを重みで決める
+GAZE_PATTERNS = (
+    "screen",       # ゲーム画面をチラ見する
+    "wander",       # 何となく視線を動かす
+    "stare",        # 画面から目を離さない
+    "double_take",  # 二度見する
+    "drift",        # 考えながら視線が泳ぐ
+    "down",         # 伏し目・うつむく
+    "audience",     # 視聴者(カメラ)を見る
+)
+
+MOOD_GAZE = {
+    "calm": {"screen": 3.0, "wander": 3.0, "audience": 0.8, "drift": 0.5},
+    "amused": {"screen": 3.0, "wander": 2.5, "audience": 1.5, "drift": 0.5},
+    "excited": {"screen": 4.0, "wander": 2.0, "audience": 1.5, "double_take": 0.8},
+    "surprised": {"double_take": 3.0, "screen": 3.0, "wander": 0.5},
+    "tense": {"stare": 4.0, "screen": 2.0, "drift": 0.6, "wander": 0.4},
+    "sad": {"down": 3.0, "drift": 1.5, "wander": 1.0, "screen": 1.0},
+}
+
+# 視線が泳ぐ(drift)ときの振れ幅と、見上げる高さ
+DRIFT_RANGE_X = 6.0
+DRIFT_LIFT = 5.0
+
+# 伏し目(down)で視線を落とす高さ
+DOWNCAST_Y = -7.0
+
+# マイクロサッカード(眼球の細かい飛び)。生体感を出すための微小な揺れ
+SACCADE_AMP = 0.025
+SACCADE_INTERVAL = (0.25, 1.1)
+
 # 首の角度を目線に変換する係数。
 # 人は視線を動かすとき目が先に動き、首が後から追いつく。EYE_LEAD が「まだ首が
 # 向いていない分を目で先行する量」、EYE_HOLD が「首の向きに合わせた定常のズレ」。
@@ -90,8 +124,9 @@ MIN_BLINK_STEP = 2.0 / FPS
 # 感情の変化に気づくまでの間隔。待機中でもこの間隔で見に行く
 MOOD_REACT_TICK = 0.2
 
-# 感情が変わってから反応のまばたきを入れるまでの間(秒)
+# 感情が変わってから反応のまばたき・仕草を入れるまでの間(秒)
 REACTION_BLINK_DELAY = (0.15, 0.5)
+REACTION_GESTURE_DELAY = (0.2, 0.8)
 
 # 呼吸を流し込むための入力パラメータ名。
 # VTube Studio の既定パラメータには呼吸用が無いので、起動時にカスタム入力
@@ -103,12 +138,21 @@ BREATH_PARAM = "Breath"
 # 呼吸で頭がわずかに上下する量。モデル側の呼吸パラメータと二重に効くので控えめに
 BREATH_TO_Y = 0.3
 
+# 副波の周期を主波の何倍にするか。割り切れない比にして、
+# 主波と副波が同じ位相で揃う周期を長くする(繰り返しに見せない)
+SUB_PERIOD_RATIO = 0.43
+
+# 眉(Brows)と口角(MouthSmile)の中立値。
+# どちらも 0.0〜1.0 で 0.5 が素の顔、0 で眉が下がりきり・口角がへの字になる。
+# 送らないでいるとVTS側の既定値 0 が使われてしまうので、毎フレーム出し続ける
+FACE_NEUTRAL = 0.5
+
 # 毎フレーム送る顔まわりの入力パラメータ。値の並び順と対応している
 FACE_PARAMS = (
     "FaceAngleX", "FaceAngleY", "FaceAngleZ",
     "EyeOpenLeft", "EyeOpenRight",
     "EyeLeftX", "EyeRightX", "EyeLeftY", "EyeRightY",
-    "MouthOpen",
+    "MouthOpen", "MouthSmile", "Brows",
 )
 
 
@@ -141,6 +185,13 @@ class MoodParams:
     head_tilt: float       # 首の傾き(Z)の固定オフセット
     mouth_speed: float     # 口パクの速さ倍率
     mouth_amp: float       # 口の開き幅倍率
+    mouth_smile: float     # 口角(0.5=中立、下げるとへの字。笑い目と頬も連動する)
+    brows: float           # 眉の高さ(0.5=中立、下げると寄る)
+    gesture_min: float     # 単発の仕草を出す間隔
+    gesture_max: float
+    period_x: float        # 首の揺れ 主波の周期(秒)。軸ごとに変えると動きに癖が出る
+    period_y: float
+    period_z: float
 
     def replace(self, **changes):
         return replace(self, **changes)
@@ -177,6 +228,23 @@ MOOD_EXPRESSIONS = {
 # 表情を切り替えるときのフェード秒数。0 だとパッと切り替わる
 EXPRESSION_FADE = 0.4
 
+# 感情の「強度」を流し込むためのカスタム入力パラメータ名(ムード -> 名前)。
+# モデルが Paramtense のような感情専用パラメータを持っている場合、表情ファイルの
+# ON/OFF ではなく 0〜1 の連続値で表情を出せる。ムードの補間がそのまま表情の濃さに
+# なるので、切り替わりが滑らかになり「少し真剣」のような中間も作れる。
+# Breath と同じく、VTS の「VTS Parameter Setup」で対応する Live2D パラメータの
+# input へ割り当てるまでは何も起きない。割り当て済みかは起動時に自動判定し、
+# 未割り当てのムードは従来どおり表情ファイルで出す
+MOOD_PARAMS = {
+    "tense": "MoodTense",
+    "sad": "MoodSad",
+    "excited": "MoodExcited",
+    "surprised": "MoodSurprised",
+}
+
+# 割り当て判定で「動いた」とみなすLive2Dパラメータの変化量
+MOOD_PARAM_DETECT_DELTA = 0.05
+
 MOODS = {
     # 平常。デフォルトの待機がこれ
     "calm": MoodParams(
@@ -190,6 +258,9 @@ MOODS = {
         look_min=4.0, look_max=10.0,
         screen_glance_chance=0.35, screen_hold=2.5,
         head_tilt=0.0, mouth_speed=1.0, mouth_amp=1.0,
+        mouth_smile=0.45, brows=0.5,
+        gesture_min=8.0, gesture_max=18.0,
+        period_x=7.3, period_y=5.7, period_z=9.1,
     ),
     # 笑ってる・楽しんでる。表情は素の顔のまま少し弾む
     "amused": MoodParams(
@@ -203,6 +274,9 @@ MOODS = {
         look_min=3.0, look_max=7.0,
         screen_glance_chance=0.45, screen_hold=2.5,
         head_tilt=1.5, mouth_speed=1.2, mouth_amp=1.0,
+        mouth_smile=0.70, brows=0.60,
+        gesture_min=5.0, gesture_max=12.0,
+        period_x=5.9, period_y=3.8, period_z=7.3,
     ),
     # 大興奮。振幅も速さも大きく、前のめり
     "excited": MoodParams(
@@ -216,6 +290,9 @@ MOODS = {
         look_min=2.0, look_max=5.0,
         screen_glance_chance=0.6, screen_hold=3.0,
         head_tilt=0.0, mouth_speed=1.6, mouth_amp=1.0,
+        mouth_smile=0.62, brows=0.78,
+        gesture_min=4.0, gesture_max=9.0,
+        period_x=6.3, period_y=4.4, period_z=5.1,
     ),
     # 驚き。持続状態としては「固まってる」。演出は別途バーストで乗る
     "surprised": MoodParams(
@@ -230,6 +307,9 @@ MOODS = {
         # 何が起きた?と真っ先に画面を確認する
         screen_glance_chance=0.7, screen_hold=1.5,
         head_tilt=0.0, mouth_speed=1.4, mouth_amp=1.0,
+        mouth_smile=0.50, brows=0.85,
+        gesture_min=6.0, gesture_max=14.0,
+        period_x=6.8, period_y=8.2, period_z=9.6,
     ),
     # 緊張・集中(thoughtfulもここへ割り当てる)。画面から目を離さず、細かく震える
     "tense": MoodParams(
@@ -244,6 +324,9 @@ MOODS = {
         # 画面から目を離さない
         screen_glance_chance=0.85, screen_hold=5.0,
         head_tilt=0.0, mouth_speed=1.1, mouth_amp=0.85,
+        mouth_smile=0.35, brows=0.30,
+        gesture_min=8.0, gesture_max=20.0,
+        period_x=5.2, period_y=6.9, period_z=8.4,
     ),
     # 落ち込み。半目・下向き・動きが重い
     "sad": MoodParams(
@@ -258,12 +341,102 @@ MOODS = {
         # うつむきがちで画面をあまり見ない
         screen_glance_chance=0.2, screen_hold=2.0,
         head_tilt=2.5, mouth_speed=0.8, mouth_amp=0.75,
+        mouth_smile=0.20, brows=0.38,
+        gesture_min=10.0, gesture_max=24.0,
+        period_x=8.1, period_y=6.2, period_z=11.3,
     ),
 }
 
 
+@dataclass(frozen=True)
+class Gesture:
+    """単発の仕草。待機モーションの上に一時的に足す動き
+
+    cycles > 0 なら往復する動き(うなずき・首振り)、0 なら姿勢を作って
+    しばらく保つ動き(首かしげ・前のめり)。amp の符号が最初に動く向き。
+    """
+
+    axis: str        # "x"(左右) / "y"(上下) / "z"(傾き)
+    amp: float       # 振幅(度)
+    seconds: float
+    cycles: float = 0.0
+
+
+# 振幅は「待機の揺れ(calmで3〜4度)より明らかに大きい」ことを基準に決める。
+# 揺れと同じくらいだと、何かしたのか分からない動きになる
+GESTURES = {
+    "nod": Gesture(axis="y", amp=-12.0, seconds=0.9, cycles=1.5),    # うなずき
+    "shake": Gesture(axis="x", amp=9.0, seconds=1.0, cycles=2.5),    # 首を振る
+    "tilt": Gesture(axis="z", amp=9.0, seconds=2.6),                 # 首かしげ
+    "lean_in": Gesture(axis="y", amp=-7.0, seconds=2.2),             # 前のめり
+    "droop": Gesture(axis="y", amp=-8.0, seconds=3.2),               # うなだれる
+}
+
+# ムードごとに出る仕草と、その出やすさ。
+# 補間はしない(仕草は抽選した瞬間に決まる離散的なもの)ので MoodParams とは別表
+MOOD_GESTURES = {
+    "calm": {"nod": 1.0, "tilt": 0.6},
+    "amused": {"nod": 2.0, "tilt": 1.0, "shake": 0.5},
+    "excited": {"nod": 3.0, "shake": 0.8, "lean_in": 1.0},
+    "surprised": {"lean_in": 1.0, "tilt": 0.5},
+    "tense": {"lean_in": 1.5, "tilt": 0.3},
+    "sad": {"droop": 2.0, "shake": 0.6, "tilt": 0.4},
+}
+
+# 仕草の立ち上がり・戻りにかける割合。
+# EASE は姿勢を保つ仕草(首かしげなど)、EDGE_FADE は往復する仕草の端の丸め。
+# 往復する仕草に全体窓を掛けると、最初と最後の振りが削れて「1回動いただけ」に
+# 見えてしまうので、端だけ短く繋ぐ
+GESTURE_EASE = 0.25
+GESTURE_EDGE_FADE = 0.15
+
+
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def smoothstep(t: float) -> float:
+    """0→1 をなめらかに繋ぐ(端で速度が0になる)"""
+    t = clamp(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def gesture_offset(gesture: Gesture, progress: float) -> float:
+    """仕草の進行度(0〜1)に対する角度
+
+    両端で必ず0に戻す。途中で待機モーションへ足しても継ぎ目が出ないように。
+    """
+    if progress <= 0.0 or progress >= 1.0:
+        return 0.0
+    if gesture.cycles > 0.0:
+        # 往復する動き。端だけ丸めて、途中の振りは削らない
+        fade = smoothstep(
+            min(progress, 1.0 - progress) / GESTURE_EDGE_FADE
+        )
+        return gesture.amp * math.sin(
+            2 * math.pi * gesture.cycles * progress
+        ) * fade
+    # 姿勢を作って保つ動き
+    if progress < GESTURE_EASE:
+        ease = smoothstep(progress / GESTURE_EASE)
+    elif progress > 1.0 - GESTURE_EASE:
+        ease = smoothstep((1.0 - progress) / GESTURE_EASE)
+    else:
+        ease = 1.0
+    return gesture.amp * ease
+
+
+def pick_gesture(mood: str, rng) -> str:
+    """そのムードで出る仕草を重み付きで選ぶ"""
+    weights = MOOD_GESTURES.get(mood) or MOOD_GESTURES["calm"]
+    total = sum(weights.values())
+    threshold = rng.random() * total
+    upto = 0.0
+    for name, weight in weights.items():
+        upto += weight
+        if threshold <= upto:
+            return name
+    return next(iter(weights))
 
 
 def lerp_params(a: MoodParams, b: MoodParams, ratio: float) -> MoodParams:
@@ -364,23 +537,119 @@ def input_parameter_names(response: Any) -> set[str]:
     return names
 
 
-def pick_look_target(params: MoodParams, rng) -> tuple[float, float, float]:
-    """次に視線を向ける先と、そこを見ている秒数を決める
+def screen_point(rng) -> tuple[float, float]:
+    """ゲーム画面の方を見るときの狙い。毎回わずかにズラす"""
+    return (
+        SCREEN_LOOK_X + rng.uniform(-SCREEN_JITTER, SCREEN_JITTER),
+        SCREEN_LOOK_Y + rng.uniform(-SCREEN_JITTER, SCREEN_JITTER),
+    )
 
-    たまにゲーム画面(向かって左上)をチラ見させると、
-    「実況者が画面を見ている」動きになって視線に意味が出る。
+
+def pick_gaze_pattern(mood: str, rng) -> str:
+    """そのムードで出る視線パターンを重み付きで選ぶ"""
+    weights = MOOD_GAZE.get(mood) or MOOD_GAZE["calm"]
+    total = sum(weights.values())
+    threshold = rng.random() * total
+    upto = 0.0
+    for name, weight in weights.items():
+        upto += weight
+        if threshold <= upto:
+            return name
+    return next(iter(weights))
+
+
+def plan_gaze(
+    pattern: str,
+    params: MoodParams,
+    rng,
+) -> list[tuple[float, float, float]]:
+    """視線パターンを (狙いX, 狙いY, 見ている秒数) の並びへ展開する
+
+    1点を見るだけでなく、二度見のように複数段階の動きを表せるようにしている。
     rng を引数に取るのは、テストで揺らぎを固定できるようにするため。
     """
-    if rng.random() < params.screen_glance_chance:
-        x = SCREEN_LOOK_X + rng.uniform(-SCREEN_JITTER, SCREEN_JITTER)
-        y = SCREEN_LOOK_Y + rng.uniform(-SCREEN_JITTER, SCREEN_JITTER)
-        hold = rng.uniform(params.screen_hold * 0.6, params.screen_hold * 1.4)
-        return x, y, hold
+    speed = max(params.speed, 0.3)
 
-    x = rng.uniform(-params.look_range_x, params.look_range_x)
-    y = rng.uniform(-params.look_range_y, params.look_range_y)
-    hold = rng.uniform(2.0, 4.0) / max(params.speed, 0.3)
-    return x, y, hold
+    if pattern == "screen":
+        x, y = screen_point(rng)
+        hold = rng.uniform(params.screen_hold * 0.6, params.screen_hold * 1.4)
+        return [(x, y, hold)]
+
+    if pattern == "stare":
+        # 画面から目を離さない。チラ見よりずっと長く留める
+        x, y = screen_point(rng)
+        return [(x, y, rng.uniform(params.screen_hold * 2.0, params.screen_hold * 3.5))]
+
+    if pattern == "double_take":
+        # 一度見て、正面へ戻して、もう一度見る
+        first_x, first_y = screen_point(rng)
+        again_x, again_y = screen_point(rng)
+        return [
+            (first_x, first_y, rng.uniform(0.3, 0.5)),
+            (rng.uniform(-2.0, 2.0), rng.uniform(-1.5, 1.5), rng.uniform(0.25, 0.45)),
+            (again_x, again_y, rng.uniform(params.screen_hold * 0.8, params.screen_hold * 1.6)),
+        ]
+
+    if pattern == "drift":
+        # 考えているときに視線が泳ぐ。上寄りを何回か彷徨う
+        return [
+            (
+                DRIFT_RANGE_X * side + rng.uniform(-1.5, 1.5),
+                DRIFT_LIFT + rng.uniform(-1.5, 1.5),
+                rng.uniform(0.6, 1.4) / speed,
+            )
+            for side in (-1.0, 0.4, -0.7)
+        ]
+
+    if pattern == "down":
+        # 伏し目。うつむいて視線を落とす
+        return [
+            (
+                rng.uniform(-2.5, 2.5),
+                DOWNCAST_Y + rng.uniform(-1.5, 1.5),
+                rng.uniform(2.0, 4.0) / speed,
+            )
+        ]
+
+    if pattern == "audience":
+        # 視聴者の方を見る(カメラ目線)。同意を求めるような間になる
+        return [
+            (
+                rng.uniform(-1.5, 1.5),
+                rng.uniform(-1.0, 1.0),
+                rng.uniform(1.5, 3.0) / speed,
+            )
+        ]
+
+    # wander(既定): ムードの範囲で何となく視線を動かす
+    return [
+        (
+            rng.uniform(-params.look_range_x, params.look_range_x),
+            rng.uniform(-params.look_range_y, params.look_range_y),
+            rng.uniform(2.0, 4.0) / speed,
+        )
+    ]
+
+
+class Saccade:
+    """眼球の細かい飛び(マイクロサッカード)
+
+    人の目は一点を見ているときも小刻みに位置を変えている。毎フレーム乱数だと
+    ただのノイズに見えるので、次に飛ぶまでは同じ位置に留める。
+    """
+
+    def __init__(self) -> None:
+        self.x = 0.0
+        self.y = 0.0
+        self._left = 0.0
+
+    def update(self, dt: float, rng) -> tuple[float, float]:
+        self._left -= dt
+        if self._left <= 0.0:
+            self._left = rng.uniform(*SACCADE_INTERVAL)
+            self.x = rng.uniform(-SACCADE_AMP, SACCADE_AMP)
+            self.y = rng.uniform(-SACCADE_AMP, SACCADE_AMP)
+        return self.x, self.y
 
 
 def rest_look_target(params: MoodParams, rng) -> tuple[float, float]:
@@ -413,18 +682,18 @@ def idle_angles(
     """
     p = params
     x = (
-        p.sway_x * math.sin(phase * 2 * math.pi / 7.3)
-        + p.sub_x * math.sin(phase * 2 * math.pi / 3.1)
+        p.sway_x * math.sin(phase * 2 * math.pi / p.period_x)
+        + p.sub_x * math.sin(phase * 2 * math.pi / (p.period_x * SUB_PERIOD_RATIO))
         + p.tremor * math.sin(phase * 2 * math.pi / 0.19)
     )
     y = (
-        p.sway_y * math.sin(phase * 2 * math.pi / 5.7)
-        + p.sub_y * math.sin(phase * 2 * math.pi / 2.3)
+        p.sway_y * math.sin(phase * 2 * math.pi / p.period_y)
+        + p.sub_y * math.sin(phase * 2 * math.pi / (p.period_y * SUB_PERIOD_RATIO))
         + p.tremor * 0.7 * math.sin(phase * 2 * math.pi / 0.23)
     )
     z = (
-        p.sway_z * math.sin(phase * 2 * math.pi / 9.1)
-        + p.sub_z * math.sin(phase * 2 * math.pi / 4.7)
+        p.sway_z * math.sin(phase * 2 * math.pi / p.period_z)
+        + p.sub_z * math.sin(phase * 2 * math.pi / (p.period_z * SUB_PERIOD_RATIO))
         + p.tremor * 0.5 * math.sin(phase * 2 * math.pi / 0.13)
         + p.head_tilt
     )
@@ -508,6 +777,10 @@ class MoodEngine:
         self._prev_mood = self.mood
         self._hold_left = 0.0
         self._burst_t: float | None = None
+        self._gesture: Gesture | None = None
+        self._gesture_t = 0.0
+        # ムードの配合。今のムードへ 1.0 で寄っていく(表情の濃さに使う)
+        self.mix = {name: (1.0 if name == self.mood else 0.0) for name in MOODS}
 
     def set_mood(self, name: str, hold: float | None = None) -> None:
         """ムードを切り替える。hold を渡すとその秒数後に元のムードへ戻る"""
@@ -531,6 +804,31 @@ class MoodEngine:
 
         self.mood = name
 
+    def start_gesture(self, name: str) -> None:
+        """単発の仕草を積む。実行中の仕草は差し替える
+
+        未知の名前は黙って無視する。仕草を増やすときに表の書き間違いで
+        モーション全体が止まると困るため。
+        """
+        gesture = GESTURES.get(name)
+        if gesture is None:
+            return
+        self._gesture = gesture
+        self._gesture_t = 0.0
+
+    def gesture_angles(self) -> tuple[float, float, float]:
+        """実行中の仕草による (x, y, z) の加算量"""
+        if self._gesture is None:
+            return 0.0, 0.0, 0.0
+        offset = gesture_offset(
+            self._gesture, self._gesture_t / self._gesture.seconds
+        )
+        if self._gesture.axis == "x":
+            return offset, 0.0, 0.0
+        if self._gesture.axis == "y":
+            return 0.0, offset, 0.0
+        return 0.0, 0.0, offset
+
     def update(self, dt: float) -> None:
         """dt 秒ぶん時間を進める。パラメータ補間と位相の更新はここだけ"""
         # 一時ムード(驚きなど)の残り時間を消化して元へ戻す
@@ -542,14 +840,22 @@ class MoodEngine:
 
         # 目標ムードへ滑らかに寄せる。切り替えの瞬間にガクッと動かないように
         target = MOODS[self.mood]
-        self.params = lerp_params(
-            self.params, target, 1.0 - math.exp(-dt / MOOD_BLEND_TAU)
-        )
+        blend = 1.0 - math.exp(-dt / MOOD_BLEND_TAU)
+        self.params = lerp_params(self.params, target, blend)
+        for name in self.mix:
+            goal = 1.0 if name == self.mood else 0.0
+            self.mix[name] += (goal - self.mix[name]) * blend
 
         if self._burst_t is not None:
             self._burst_t += dt
             if self._burst_t >= SURPRISE_BURST:
                 self._burst_t = None
+
+        if self._gesture is not None:
+            self._gesture_t += dt
+            if self._gesture_t >= self._gesture.seconds:
+                self._gesture = None
+                self._gesture_t = 0.0
 
         env = self.burst_strength()
         self.phase += dt * self.params.speed
@@ -560,6 +866,19 @@ class MoodEngine:
         if self._burst_t is None:
             return 0.0
         return surprise_envelope(self._burst_t / SURPRISE_BURST)
+
+    def mood_param_values(self) -> dict[str, float]:
+        """感情パラメータへ送る強度(ムード -> 0〜1)
+
+        驚きだけは補間を待たずにバーストの強さで立ち上げる。一瞬の演出なので、
+        滑らかに寄せていると山が過ぎてしまう。
+        """
+        values = {
+            mood: clamp(self.mix.get(mood, 0.0), 0.0, 1.0) for mood in MOOD_PARAMS
+        }
+        if "surprised" in values:
+            values["surprised"] = max(values["surprised"], self.burst_strength())
+        return values
 
     def eye_open_bonus(self) -> float:
         """驚いた直後だけ目を見開く量"""
@@ -572,7 +891,8 @@ class MoodEngine:
         if env > 0.0:
             z += SURPRISE_TILT * env
             y += SURPRISE_LIFT * env
-        return x, y, z, breath
+        gesture_x, gesture_y, gesture_z = self.gesture_angles()
+        return x + gesture_x, y + gesture_y, z + gesture_z, breath
 
 
 class VTubeStudioController:
@@ -603,6 +923,7 @@ class VTubeStudioController:
         self.runtime: dict[str, Any] = {
             "breath_param": None,   # 呼吸パラメータ名(見つからなければ None)
             "expressions": {},      # ムード名 -> 表情ファイル
+            "mood_params": {},      # ムード名 -> 感情パラメータ名(割り当て済みのみ)
         }
         self._plugin_info = dict(plugin_info or PLUGIN_INFO)
         self._connect = connect
@@ -646,6 +967,14 @@ class VTubeStudioController:
             loop.call_soon_threadsafe(self.engine.set_mood, mood)
         else:
             self.engine.set_mood(mood)
+
+    def play_gesture(self, name: str) -> None:
+        """単発の仕草(うなずきなど)をその場で出す"""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self.engine.start_gesture, name)
+        else:
+            self.engine.start_gesture(name)
 
     def set_look_override(self, target: tuple[float, float] | None) -> None:
         """視線の狙いを固定する。None を渡すと自動のきょろきょろへ戻る
@@ -715,7 +1044,8 @@ class VTubeStudioController:
         self._vts_lock = asyncio.Lock()
         try:
             await self._reset_expressions(vts)
-            await self._setup_parameters(vts)
+            names = await self._setup_parameters(vts)
+            self.runtime["mood_params"] = await self._setup_mood_params(vts, names)
             await self._setup_expressions(vts)
         except Exception as exc:
             print(
@@ -735,6 +1065,7 @@ class VTubeStudioController:
                 self._sender_loop(vts),
                 self._blink_director(),
                 self._look_director(),
+                self._gesture_director(),
                 self._mouth_director(),
                 self._expression_director(vts),
                 self._stop_watcher(),
@@ -834,6 +1165,98 @@ class VTubeStudioController:
             )
         return names
 
+    async def _live2d_values(self, vts: Any) -> dict[str, float]:
+        """モデル側のLive2Dパラメータの現在値"""
+        response = await self._request(
+            vts, vts.vts_request.BaseRequest("Live2DParameterListRequest", {})
+        )
+        try:
+            entries = response["data"]["parameters"]
+        except (TypeError, KeyError):
+            return {}
+        if not isinstance(entries, list):
+            return {}
+        return {
+            e["name"]: float(e["value"])
+            for e in entries
+            if isinstance(e, dict) and e.get("name") and e.get("value") is not None
+        }
+
+    async def _push(self, vts: Any, values: dict[str, float], frames: int = 3) -> None:
+        """指定の入力パラメータを数フレームだけ押し込む(割り当て判定用)"""
+        for _ in range(frames):
+            await self._request(
+                vts,
+                vts.vts_request.requestSetMultiParameterValue(
+                    parameters=list(values),
+                    values=list(values.values()),
+                    face_found=True,
+                ),
+            )
+            await asyncio.sleep(1 / FPS)
+
+    async def _moves_model(
+        self,
+        vts: Any,
+        before: dict[str, float],
+        active: dict[str, float],
+    ) -> bool:
+        """入力を押したときにモデル側が動くか＝割り当て済みかを調べる
+
+        どのLive2Dパラメータへ割り当てたかは利用者の自由なので、名前を決め打ちせず
+        「何かが動いたか」で判定する。before は全部0で押したときの値。
+        """
+        idle = {name: 0.0 for name in MOOD_PARAMS.values()}
+        await self._push(vts, {**idle, **active})
+        after = await self._live2d_values(vts)
+        return any(
+            abs(value - before[name]) > MOOD_PARAM_DETECT_DELTA
+            for name, value in after.items()
+            if name in before
+        )
+
+    async def _setup_mood_params(self, vts: Any, names: set[str]) -> dict[str, str]:
+        """感情パラメータを用意し、VTS側で割り当て済みのものだけ採用する"""
+        for param in MOOD_PARAMS.values():
+            if param in names:
+                continue
+            await self._request(
+                vts,
+                vts.vts_request.requestCustomParameter(
+                    param, min=0.0, max=1.0, default_value=0.0, info="感情の強度"
+                ),
+            )
+
+        idle = {param: 0.0 for param in MOOD_PARAMS.values()}
+        await self._push(vts, idle)
+        before = await self._live2d_values(vts)
+
+        # まとめて押して何も動かなければ、1本ずつ試すまでもなく未割り当て
+        if not await self._moves_model(
+            vts, before, {param: 1.0 for param in MOOD_PARAMS.values()}
+        ):
+            await self._push(vts, idle)
+            print(
+                "感情パラメータ（"
+                + "、".join(MOOD_PARAMS.values())
+                + "）を作成しました。VTube Studioの「VTS Parameter Setup」で"
+                "感情用Live2Dパラメータのinputへ割り当てると、表情の切り替えが"
+                "ON/OFFではなく強度の変化になります（未割り当ての間は"
+                "従来どおり表情ファイルを使います）。"
+            )
+            return {}
+
+        assigned = {}
+        for mood, param in MOOD_PARAMS.items():
+            if await self._moves_model(vts, before, {param: 1.0}):
+                assigned[mood] = param
+        await self._push(vts, idle)
+        print(
+            "感情パラメータを強度で送ります: "
+            + "、".join(f"{mood}={param}" for mood, param in assigned.items())
+        )
+        return assigned
+
     async def _create_breath_parameter(self, vts: Any) -> bool:
         """呼吸用のカスタム入力パラメータを作る
 
@@ -889,7 +1312,11 @@ class VTubeStudioController:
         by_name = expression_files_by_name(
             await self._request_expression_state(vts)
         )
-        self.runtime["expressions"] = resolve_mood_expressions(by_name)
+        expressions = resolve_mood_expressions(by_name)
+        # 強度で出せるムードは表情ファイルを使わない(同じ顔を二重に動かさない)
+        for mood in self.runtime["mood_params"]:
+            expressions.pop(mood, None)
+        self.runtime["expressions"] = expressions
 
         missing = missing_mood_expressions(by_name)
         if missing:
@@ -920,6 +1347,7 @@ class VTubeStudioController:
         prev = time.perf_counter()
         # 首の狙い位置を滑らかに追従させるための現在値
         cur_x, cur_y = 0.0, 0.0
+        saccade = Saccade()
 
         while True:
             now = time.perf_counter()
@@ -953,21 +1381,44 @@ class VTubeStudioController:
             # 上下は首と目の向きを揃える。呼吸は目線に乗せない
             # (呼吸のたびに目玉が上下すると落ち着かない)
             look_y, eye_y = vertical_gaze(cur_y, aim_y - cur_y, sway_y)
+            # 一点を見ているときも眼球は細かく飛んでいる
+            saccade_x, saccade_y = saccade.update(dt, random)
+            eye_x = clamp(eye_x + saccade_x, -1.0, 1.0)
+            eye_y = clamp(eye_y + saccade_y, -1.0, 1.0)
 
             params = list(FACE_PARAMS)
             values = [
-                sway_x + cur_x,
-                look_y + (sway_y + breath_y) * LOOK_Y_SIGN,
-                sway_z + turn_tilt(cur_x),
+                # 揺れ・視線・仕草が重なると定格を超えうるので、ここで丸める
+                clamp(sway_x + cur_x, -FACE_ANGLE_LIMIT, FACE_ANGLE_LIMIT),
+                clamp(
+                    look_y + (sway_y + breath_y) * LOOK_Y_SIGN,
+                    -FACE_ANGLE_LIMIT,
+                    FACE_ANGLE_LIMIT,
+                ),
+                clamp(
+                    sway_z + turn_tilt(cur_x),
+                    -FACE_ANGLE_LIMIT,
+                    FACE_ANGLE_LIMIT,
+                ),
                 eye, eye,
                 # 目線も首の動きに連動させると生きてる感が出る
                 eye_x, eye_x, eye_y, eye_y,
                 self.state["mouth_open"],
+                # 眉と口角はムードの値をそのまま。送らないとVTS側の既定値0が
+                # 使われ、眉が下がりきった顔になってしまう
+                clamp(p.mouth_smile, 0.0, 1.0),
+                clamp(p.brows, 0.0, 1.0),
             ]
 
             if self.runtime["breath_param"]:
                 params.append(self.runtime["breath_param"])
                 values.append(breath)
+
+            if self.runtime["mood_params"]:
+                intensity = self.engine.mood_param_values()
+                for mood, param in self.runtime["mood_params"].items():
+                    params.append(param)
+                    values.append(intensity.get(mood, 0.0))
 
             await self._request(
                 vts,
@@ -1021,16 +1472,39 @@ class VTubeStudioController:
                 continue
 
             p = self.engine.params
-            x, y, hold = pick_look_target(p, random)
-            self.state["look_x"] = x
-            self.state["look_y"] = y
-
-            # しばらくしたら待機位置に戻る。ここでも感情が動けば見直す
-            if await self.wait_for_mood_change(hold):
+            pattern = pick_gaze_pattern(self.engine.mood, random)
+            interrupted = False
+            for x, y, hold in plan_gaze(pattern, p, random):
+                self.state["look_x"] = x
+                self.state["look_y"] = y
+                # 視線を固定されたら自動の動きは引っ込める
+                if self.state["look_override"] is not None:
+                    interrupted = True
+                    break
+                # ここでも感情が動けば、途中でもパターンを組み直す
+                if await self.wait_for_mood_change(hold):
+                    interrupted = True
+                    break
+            if interrupted:
                 continue
             self.state["look_x"], self.state["look_y"] = rest_look_target(
                 p, random
             )
+
+    async def _gesture_director(self) -> None:
+        """たまに単発の仕草(うなずき・首かしげなど)を出す
+
+        待機の揺れは振幅と速さしか変わらないので、そのままだとどのムードも
+        同じ動きに見える。ムードごとに違う仕草を混ぜて印象を分ける。
+        """
+        while True:
+            p = self.engine.params
+            if await self.wait_for_mood_change(
+                random.uniform(p.gesture_min, p.gesture_max)
+            ):
+                # 感情が動いた直後は、その感情らしい仕草で反応する
+                await asyncio.sleep(random.uniform(*REACTION_GESTURE_DELAY))
+            self.engine.start_gesture(pick_gesture(self.engine.mood, random))
 
     async def _mouth_director(self) -> None:
         """喋っている間だけ口をパクパクさせる

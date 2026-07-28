@@ -22,7 +22,9 @@ from typing import Callable, Iterable, Sequence
 
 from .vtube import (
     EMOTION_TO_MOOD,
+    GESTURES,
     MOOD_EXPRESSIONS,
+    MOOD_GAZE,
     SCREEN_LOOK_X,
     SCREEN_LOOK_Y,
     VTubeStudioController,
@@ -30,6 +32,17 @@ from .vtube import (
 )
 
 DEFAULT_HOLD = 6.0
+
+# 視線パターンの表示名（何が起きるはずかを画面に出すため）
+GAZE_LABELS = {
+    "screen": "画面チラ見",
+    "wander": "きょろきょろ",
+    "stare": "ガン見",
+    "double_take": "二度見",
+    "drift": "視線が泳ぐ",
+    "down": "伏し目",
+    "audience": "カメラ目線",
+}
 
 
 @dataclass(frozen=True)
@@ -46,6 +59,7 @@ class DemoStep:
     look: tuple[float, float] | None  # None は自動のきょろきょろに任せる
     speak: bool
     seconds: float
+    gesture: str | None = None  # 単発の仕草を出すステップだけ指定する
 
 
 def build_demo_steps(
@@ -112,14 +126,38 @@ def build_demo_steps(
     for name, check in mood_steps:
         mood = resolve_emotion_mood(name)
         expression = MOOD_EXPRESSIONS.get(mood, "表情なし")
+        gaze = GAZE_LABELS.get(
+            max(MOOD_GAZE[mood], key=lambda k: MOOD_GAZE[mood][k]), ""
+        )
         steps.append(
             DemoStep(
                 title=f"感情: {name}（ムード={mood} / 表情={expression}）",
-                check=f"{check}。喋っている間だけ口が動く",
+                check=f"{check}。視線は「{gaze}」が出やすい。喋る間だけ口が動く",
                 emotion=name,
                 look=None,
                 speak=True,
                 seconds=hold,
+            )
+        )
+
+    # 単発の仕草。待機の揺れとは別に足される動きなので、1つずつ見て確認する
+    gesture_checks = {
+        "nod": "首を縦に振る（相槌）",
+        "shake": "首を横に振る（否定・呆れ）",
+        "tilt": "首をかしげてしばらく保つ。体も一緒に傾く",
+        "lean_in": "画面へ前のめりになる",
+        "droop": "うなだれて重く沈む",
+    }
+    for name, check in gesture_checks.items():
+        steps.append(
+            DemoStep(
+                title=f"仕草: {name}",
+                check=f"{check}。終わったら待機の揺れへ滑らかに戻る",
+                emotion="calm",
+                look=None,
+                speak=False,
+                seconds=max(GESTURES[name].seconds + 0.8, hold * 0.6),
+                gesture=name,
             )
         )
 
@@ -179,6 +217,8 @@ def run_steps(
             log(describe_step(index, total, step))
             controller.set_emotion(step.emotion)
             controller.set_look_override(step.look)
+            if step.gesture:
+                controller.play_gesture(step.gesture)
             if step.speak:
                 controller.set_speaking(True)
                 sleep(step.seconds)

@@ -10,7 +10,6 @@ from game_window_ocr.vtube import (
     VTubeStudioController,
     resolve_emotion_mood,
     rest_look_target,
-    pick_look_target,
     turn_tilt,
 )
 
@@ -195,6 +194,208 @@ class TestMoodReaction:
         assert elapsed >= 0.5
 
 
+class TestFaceExpressionParams:
+    """眉と口角(VTSのBrows / MouthSmile)のムード連動
+
+    どちらも 0.5 が中立で、0 で眉が下がりきる・口角がへの字になる。
+    送らないと 0 が使われてしまうため、常に値を出し続ける必要がある。
+    """
+
+    def test_brows_and_smile_are_sent_every_frame(self) -> None:
+        """眉と口角は毎フレーム送る対象に入っている"""
+        assert "Brows" in vtube.FACE_PARAMS
+        assert "MouthSmile" in vtube.FACE_PARAMS
+
+    def test_values_stay_in_range(self) -> None:
+        """VTSの定格(0〜1)に収まる"""
+        for name, params in vtube.MOODS.items():
+            assert 0.0 <= params.brows <= 1.0, name
+            assert 0.0 <= params.mouth_smile <= 1.0, name
+
+    def test_no_mood_leaves_the_face_at_the_default_zero(self) -> None:
+        """どのムードも中立(0.5)から極端に外れた顔で固定しない"""
+        for name, params in vtube.MOODS.items():
+            assert abs(params.brows - vtube.FACE_NEUTRAL) <= 0.4, name
+            assert abs(params.mouth_smile - vtube.FACE_NEUTRAL) <= 0.4, name
+
+    def test_moods_differ_in_the_face(self) -> None:
+        """楽しいときは口角と眉が上がり、沈んだときは下がる"""
+        calm = vtube.MOODS["calm"]
+        assert vtube.MOODS["amused"].mouth_smile > calm.mouth_smile
+        assert vtube.MOODS["excited"].brows > calm.brows
+        assert vtube.MOODS["surprised"].brows > calm.brows
+        assert vtube.MOODS["sad"].mouth_smile < calm.mouth_smile
+        assert vtube.MOODS["tense"].brows < calm.brows
+
+    def test_calm_and_amused_are_distinguishable(self) -> None:
+        """表情ファイルを持たないcalmとamusedが、顔つきで区別できる"""
+        calm = vtube.MOODS["calm"]
+        amused = vtube.MOODS["amused"]
+        difference = abs(calm.mouth_smile - amused.mouth_smile) + abs(
+            calm.brows - amused.brows
+        )
+        assert difference >= 0.15
+
+
+class TestIdleWaveform:
+    """待機モーションの波形（ムードごとの個性）"""
+
+    def test_periods_are_positive(self) -> None:
+        """周期は正の値（0除算やゼロ周期にしない）"""
+        for name, params in vtube.MOODS.items():
+            assert params.period_x > 0.0, name
+            assert params.period_y > 0.0, name
+            assert params.period_z > 0.0, name
+
+    def test_moods_are_not_the_same_dance_at_different_speeds(self) -> None:
+        """ムードごとに軸の周期比が違う（速度違いの同じ振り付けにしない）"""
+        ratios = {
+            name: (
+                round(params.period_y / params.period_x, 3),
+                round(params.period_z / params.period_x, 3),
+            )
+            for name, params in vtube.MOODS.items()
+        }
+        assert len(set(ratios.values())) == len(ratios), ratios
+
+    def test_period_changes_the_waveform(self) -> None:
+        """周期を変えると波形が変わる（振幅だけの違いにならない）"""
+        base = vtube.MOODS["calm"]
+        faster = base.replace(period_x=base.period_x * 0.5)
+        same_phase = 2.0
+        assert vtube.idle_angles(same_phase, base)[0] != pytest.approx(
+            vtube.idle_angles(same_phase, faster)[0]
+        )
+
+    def test_waveform_stays_continuous_while_the_mood_blends(self) -> None:
+        """ムード切り替えで周期が変わっても、角度が飛ばない"""
+        engine = vtube.MoodEngine("sad")
+        engine.update(1.0)
+        engine.set_mood("excited")
+        previous = engine.angles()[:3]
+        for _ in range(int(3 * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+            current = engine.angles()[:3]
+            for before, after in zip(previous, current):
+                assert abs(after - before) < 2.0, "波形が不連続に飛んでいます"
+            previous = current
+
+
+class TestGestures:
+    """単発の仕草（うなずき・首かしげ・首振りなど）"""
+
+    def test_gesture_starts_and_ends_at_zero(self) -> None:
+        """仕草は始点と終点で0に戻る（待機モーションへ滑らかに戻す）"""
+        for name, gesture in vtube.GESTURES.items():
+            assert vtube.gesture_offset(gesture, 0.0) == 0.0, name
+            assert vtube.gesture_offset(gesture, 1.0) == 0.0, name
+
+    def test_gesture_never_exceeds_its_amplitude(self) -> None:
+        """振幅を超えて首が飛ばない"""
+        for name, gesture in vtube.GESTURES.items():
+            for step in range(101):
+                offset = vtube.gesture_offset(gesture, step / 100)
+                assert abs(offset) <= abs(gesture.amp) + 1e-9, name
+
+    def test_oscillating_gesture_swings_both_ways(self) -> None:
+        """うなずき・首振りは往復する"""
+        for name in ("nod", "shake"):
+            gesture = vtube.GESTURES[name]
+            values = [vtube.gesture_offset(gesture, s / 100) for s in range(101)]
+            assert min(values) < -0.5 and max(values) > 0.5, name
+
+    def test_gesture_stands_out_from_the_idle_sway(self) -> None:
+        """仕草は待機の揺れよりはっきり大きい
+
+        揺れに埋もれる振幅だと「何かしたのか分からない」動きになる。
+        """
+        calm = vtube.MOODS["calm"]
+        sway = {
+            "x": calm.sway_x + calm.sub_x,
+            "y": calm.sway_y + calm.sub_y,
+            "z": calm.sway_z + calm.sub_z,
+        }
+        for name, gesture in vtube.GESTURES.items():
+            peak = max(
+                abs(vtube.gesture_offset(gesture, s / 500)) for s in range(501)
+            )
+            assert peak >= sway[gesture.axis] * 2.0, (
+                f"{name}が待機の揺れ({sway[gesture.axis]:.1f}度)に埋もれます: "
+                f"{peak:.1f}度"
+            )
+
+    def test_oscillating_gesture_reaches_its_amplitude(self) -> None:
+        """往復の山が削れず、指定した振幅まで振れる"""
+        for name in ("nod", "shake"):
+            gesture = vtube.GESTURES[name]
+            peak = max(
+                abs(vtube.gesture_offset(gesture, s / 500)) for s in range(501)
+            )
+            assert peak >= abs(gesture.amp) * 0.95, name
+
+    def test_every_swing_is_visible(self) -> None:
+        """往復のどの振りも見える大きさになる（最初と最後だけ削られない）"""
+        for name, expected in (("nod", 3), ("shake", 5)):
+            gesture = vtube.GESTURES[name]
+            values = [vtube.gesture_offset(gesture, s / 500) for s in range(501)]
+            big = 0
+            for index in range(1, len(values) - 1):
+                if (
+                    abs(values[index]) >= abs(gesture.amp) * 0.8
+                    and abs(values[index]) >= abs(values[index - 1])
+                    and abs(values[index]) > abs(values[index + 1])
+                ):
+                    big += 1
+            assert big >= expected, f"{name}の振りが{big}回しか見えません"
+
+    def test_held_gesture_reaches_and_keeps_its_pose(self) -> None:
+        """首かしげ・前のめりは姿勢を作ってしばらく保つ"""
+        gesture = vtube.GESTURES["tilt"]
+        middle = vtube.gesture_offset(gesture, 0.5)
+        assert middle == pytest.approx(gesture.amp, abs=0.01)
+
+    def test_every_mood_has_gestures(self) -> None:
+        """全ムードに仕草が割り当てられている"""
+        assert set(vtube.MOOD_GESTURES) == set(vtube.MOODS)
+        for mood, weights in vtube.MOOD_GESTURES.items():
+            assert weights, mood
+            for name in weights:
+                assert name in vtube.GESTURES, f"{mood}に未定義の仕草: {name}"
+
+    def test_moods_use_different_gestures(self) -> None:
+        """ムードごとに出る仕草が違う（沈んだときにうなずかない等）"""
+        assert vtube.MOOD_GESTURES["sad"] != vtube.MOOD_GESTURES["excited"]
+        assert "droop" in vtube.MOOD_GESTURES["sad"]
+        assert "nod" in vtube.MOOD_GESTURES["excited"]
+
+    def test_pick_gesture_respects_weights(self) -> None:
+        """重みの大きい仕草がよく出る"""
+        counts: dict[str, int] = {}
+        for _ in range(2000):
+            name = vtube.pick_gesture("excited", random)
+            counts[name] = counts.get(name, 0) + 1
+        assert set(counts) <= set(vtube.MOOD_GESTURES["excited"])
+        assert counts["nod"] > counts["shake"], counts
+
+    def test_engine_plays_a_gesture_and_returns_to_idle(self) -> None:
+        """エンジンに仕草を積むと角度が動き、終われば待機へ戻る"""
+        engine = vtube.MoodEngine("calm")
+        engine.start_gesture("tilt")
+        peak = 0.0
+        for _ in range(int(vtube.GESTURES["tilt"].seconds * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+            peak = max(peak, abs(engine.gesture_angles()[2]))
+        assert peak > 4.0, f"首かしげが小さすぎます: {peak}"
+        engine.update(1 / vtube.FPS)
+        assert engine.gesture_angles() == (0.0, 0.0, 0.0)
+
+    def test_unknown_gesture_is_ignored(self) -> None:
+        """未知の仕草名でも落ちない"""
+        engine = vtube.MoodEngine("calm")
+        engine.start_gesture("moonwalk")
+        assert engine.gesture_angles() == (0.0, 0.0, 0.0)
+
+
 class TestBlinkTiming:
     def test_every_phase_lasts_at_least_two_frames(self) -> None:
         """30fpsで送るので、まばたきの各段階は最低2フレーム持たせる
@@ -245,19 +446,19 @@ class TestLookMotion:
         """ゲーム画面のチラ見は右下の小さい表示でも分かる大きさで首を振る"""
         rng = _AlwaysGlanceRng()
         for mood, params in vtube.MOODS.items():
-            x, y, _hold = pick_look_target(params, rng)
+            x, y, _hold = vtube.plan_gaze("screen", params, rng)[0]
             assert x <= -20.0, f"{mood}のチラ見が小さすぎます: x={x}"
             assert y >= 6.0, f"{mood}のチラ見が上を向いていません: y={y}"
 
     def test_screen_glance_stays_inside_vts_range(self) -> None:
         """振り幅を大きくしてもVTSのFaceAngle定格(±30)を超えない"""
-        rng = _AlwaysGlanceRng()
-        params = vtube.MOODS["calm"]
-        for _ in range(200):
-            x, y, _hold = pick_look_target(params, random)
-            assert -30.0 < x < 30.0
-            assert -30.0 < y < 30.0
-        assert abs(pick_look_target(params, rng)[0]) < 30.0
+        for pattern in vtube.GAZE_PATTERNS:
+            for params in vtube.MOODS.values():
+                for _ in range(50):
+                    for x, y, hold in vtube.plan_gaze(pattern, params, random):
+                        assert -30.0 < x < 30.0, pattern
+                        assert -30.0 < y < 30.0, pattern
+                        assert hold > 0.0, pattern
 
     def test_head_tilts_toward_the_direction_of_the_turn(self) -> None:
         """振り向いた側へ首も傾く（首の角度だけの平行移動にしない）"""
@@ -282,9 +483,218 @@ class TestLookMotion:
         """チラ見以外のきょろきょろはムードの振れ幅に収まる"""
         rng = _NeverGlanceRng()
         for params in vtube.MOODS.values():
-            x, y, _hold = pick_look_target(params, rng)
+            x, y, _hold = vtube.plan_gaze("wander", params, rng)[0]
             assert abs(x) <= params.look_range_x
             assert abs(y) <= params.look_range_y
+
+
+class TestMoodMix:
+    """感情の強度（表情のON/OFFではなく連続値で送るための配合）"""
+
+    def test_mix_covers_every_mood(self) -> None:
+        """全ムード分の強度を持つ"""
+        engine = vtube.MoodEngine("calm")
+        assert set(engine.mix) == set(vtube.MOODS)
+
+    def test_mix_eases_toward_the_current_mood(self) -> None:
+        """今のムードの強度が上がり、他は下がる"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_mood("sad")
+        for _ in range(int(3 * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+        assert engine.mix["sad"] > 0.9
+        assert engine.mix["calm"] < 0.1
+
+    def test_mix_changes_continuously(self) -> None:
+        """切り替えの瞬間に強度が飛ばない（表情がパチっと変わらない）"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_mood("excited")
+        previous = dict(engine.mix)
+        for _ in range(int(2 * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+            for name, value in engine.mix.items():
+                assert abs(value - previous[name]) < 0.2
+            previous = dict(engine.mix)
+
+    def test_surprise_spikes_immediately(self) -> None:
+        """驚きは補間を待たずに立ち上がる（一瞬の演出なので）"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_mood("surprised")
+        engine.update(0.1)
+        assert engine.mood_param_values()["surprised"] > 0.5
+
+    def test_only_moods_with_a_parameter_are_sent(self) -> None:
+        """パラメータを持つムードだけ強度を出す（calm/amusedは素の顔）"""
+        engine = vtube.MoodEngine("calm")
+        assert set(engine.mood_param_values()) == set(vtube.MOOD_PARAMS)
+        assert "calm" not in vtube.MOOD_PARAMS
+
+
+class TestContinuousMoodParams:
+    """感情パラメータが割り当て済みかどうかで動作が切り替わるか"""
+
+    def _start(self, assigned: bool):
+        fake = _FakeVts(mood_params_assigned=assigned)
+
+        async def connect():
+            return fake
+
+        controller = VTubeStudioController(connect=connect)
+        assert controller.start(wait=5.0) is True
+        return controller, fake
+
+    def test_creates_the_custom_parameters(self) -> None:
+        """起動時に感情用のカスタム入力パラメータを作る"""
+        controller, fake = self._start(assigned=False)
+        try:
+            created = {
+                request["data"]["parameterName"]
+                for request in list(fake.requests)
+                if request.get("messageType") == "ParameterCreationRequest"
+            }
+            assert set(vtube.MOOD_PARAMS.values()) <= created
+        finally:
+            controller.stop()
+
+    def test_sends_intensity_when_assigned(self) -> None:
+        """割り当て済みなら強度を毎フレーム送る"""
+        controller, fake = self._start(assigned=True)
+        try:
+            controller.set_emotion("sad")
+
+            def sent(name: str):
+                for request in reversed(list(fake.requests)):
+                    if request.get("messageType") != "InjectParameterDataRequest":
+                        continue
+                    for parameter in request["data"]["parameterValues"]:
+                        if parameter["id"] == name:
+                            return parameter["value"]
+                return None
+
+            assert _wait_until(
+                lambda: (sent(vtube.MOOD_PARAMS["sad"]) or 0.0) > 0.8
+            ), "悲しみの強度が送られていません"
+        finally:
+            controller.stop()
+
+    def test_expression_file_is_not_used_when_assigned(self) -> None:
+        """強度で表現できるムードは、表情ファイルを二重に出さない"""
+        controller, fake = self._start(assigned=True)
+        try:
+            controller.set_emotion("sad")
+            time.sleep(0.6)
+            activated = [
+                request
+                for request in list(fake.requests)
+                if request.get("messageType") == "ExpressionActivationRequest"
+                and request["data"].get("active") is True
+            ]
+            assert not activated, "強度とファイルの両方で表情を出しています"
+        finally:
+            controller.stop()
+
+    def test_falls_back_to_expressions_when_not_assigned(self) -> None:
+        """未割り当てなら従来どおり表情ファイルを使う"""
+        controller, fake = self._start(assigned=False)
+        try:
+            controller.set_emotion("sad")
+            assert _wait_until(
+                lambda: any(
+                    request.get("messageType") == "ExpressionActivationRequest"
+                    and request["data"].get("expressionFile") == "sad.exp3.json"
+                    and request["data"].get("active") is True
+                    for request in list(fake.requests)
+                )
+            ), "フォールバックの表情が出ていません"
+        finally:
+            controller.stop()
+
+
+class TestGazePatterns:
+    """名前のついた視線パターン（二度見・伏し目・ガン見など）"""
+
+    def test_every_mood_has_gaze_patterns(self) -> None:
+        """全ムードに視線パターンが割り当てられている"""
+        assert set(vtube.MOOD_GAZE) == set(vtube.MOODS)
+        for mood, weights in vtube.MOOD_GAZE.items():
+            assert weights, mood
+            for name in weights:
+                assert name in vtube.GAZE_PATTERNS, f"{mood}に未定義: {name}"
+
+    def test_double_take_looks_back_at_the_screen(self) -> None:
+        """二度見は 画面→正面→もう一度画面 の順に動く"""
+        steps = vtube.plan_gaze("double_take", vtube.MOODS["surprised"], random)
+        assert len(steps) >= 3
+        assert steps[0][0] < -15.0
+        assert abs(steps[1][0]) < 6.0, "いったん視線を戻さないと二度見にならない"
+        assert steps[-1][0] < -15.0
+
+    def test_downcast_gaze_looks_down(self) -> None:
+        """伏し目は下を向く"""
+        x, y, _hold = vtube.plan_gaze("down", vtube.MOODS["sad"], random)[0]
+        assert y < -3.0
+        assert abs(x) < 6.0
+
+    def test_stare_holds_longer_than_a_glance(self) -> None:
+        """ガン見はチラ見より長く画面に留まる"""
+        params = vtube.MOODS["tense"]
+        rng = _AlwaysGlanceRng()
+        stare = vtube.plan_gaze("stare", params, rng)[0]
+        glance = vtube.plan_gaze("screen", params, rng)[0]
+        assert stare[2] > glance[2]
+        assert stare[0] < -15.0
+
+    def test_audience_gaze_faces_the_camera(self) -> None:
+        """カメラ目線は正面を向く"""
+        x, y, _hold = vtube.plan_gaze("audience", vtube.MOODS["amused"], random)[0]
+        assert abs(x) < 4.0 and abs(y) < 4.0
+
+    def test_drifting_gaze_moves_in_several_steps(self) -> None:
+        """考え中の泳ぐ視線は何段階かに分けて動く"""
+        steps = vtube.plan_gaze("drift", vtube.MOODS["tense"], random)
+        assert len(steps) >= 2
+        assert len({(x, y) for x, y, _ in steps}) >= 2
+
+    def test_mood_picks_its_own_pattern(self) -> None:
+        """ムードごとに出やすい視線パターンが違う"""
+        counts: dict[str, int] = {}
+        for _ in range(2000):
+            name = vtube.pick_gaze_pattern("tense", random)
+            counts[name] = counts.get(name, 0) + 1
+        assert counts.get("stare", 0) > counts.get("wander", 0), counts
+        assert "down" in vtube.MOOD_GAZE["sad"]
+        assert "double_take" in vtube.MOOD_GAZE["surprised"]
+
+    def test_unknown_pattern_falls_back_to_wander(self) -> None:
+        """未知のパターン名でも視線が止まらない"""
+        steps = vtube.plan_gaze("moonwalk", vtube.MOODS["calm"], random)
+        assert steps
+
+
+class TestSaccade:
+    """マイクロサッカード（視線の微細な揺れ）"""
+
+    def test_offset_is_small(self) -> None:
+        """目線が泳がない程度の微小な揺れに留める"""
+        saccade = vtube.Saccade()
+        for _ in range(500):
+            x, y = saccade.update(1 / vtube.FPS, random)
+            assert abs(x) <= vtube.SACCADE_AMP
+            assert abs(y) <= vtube.SACCADE_AMP
+
+    def test_offset_changes_over_time(self) -> None:
+        """時間が経つと別の位置へ飛ぶ（固定値ではない）"""
+        saccade = vtube.Saccade()
+        seen = set()
+        for _ in range(600):
+            seen.add(saccade.update(1 / vtube.FPS, random))
+        assert len(seen) >= 3
+
+    def test_offset_is_held_between_jumps(self) -> None:
+        """飛ぶまでは同じ位置に留まる（毎フレーム乱数だとブレて見える）"""
+        saccade = vtube.Saccade()
+        first = saccade.update(1 / vtube.FPS, random)
+        assert saccade.update(1 / vtube.FPS, random) == first
 
 
 class TestControllerOffline:
@@ -363,15 +773,38 @@ _FAKE_EXPRESSIONS = [
 
 
 class _FakeVts:
-    def __init__(self) -> None:
+    def __init__(self, mood_params_assigned: bool = False) -> None:
         self.vts_request = _FakeRequestFactory()
         self.requests: list[dict] = []
         self.active_files: set[str] = set()
         self.closed = False
+        # VTS側で感情用カスタムパラメータが割り当て済みかどうか
+        self.mood_params_assigned = mood_params_assigned
+        self.injected: dict[str, float] = {}
+
+    def _live2d_parameters(self) -> list[dict]:
+        """割り当て済みなら、注入した感情パラメータがモデル側へ現れる"""
+        values = {}
+        for mood, name in vtube.MOOD_PARAMS.items():
+            live2d_name = f"Param{mood.capitalize()}"
+            values[live2d_name] = (
+                self.injected.get(name, 0.0)
+                if self.mood_params_assigned
+                else 0.0
+            )
+        return [{"name": k, "value": v} for k, v in values.items()]
 
     async def request(self, payload):
         self.requests.append(payload)
         message_type = payload.get("messageType")
+        if message_type == "InjectParameterDataRequest":
+            for entry in payload["data"]["parameterValues"]:
+                self.injected[entry["id"]] = entry["value"]
+        if message_type == "Live2DParameterListRequest":
+            return {
+                "messageType": "Live2DParameterListResponse",
+                "data": {"parameters": self._live2d_parameters()},
+            }
         if message_type == "InputParameterListRequest":
             return {
                 "messageType": "InputParameterListResponse",
@@ -551,6 +984,76 @@ class TestControllerIntegration:
         finally:
             controller.stop()
 
+    def test_head_angles_stay_inside_the_vts_range(self) -> None:
+        """画面を見ながら首を振ってもFaceAngleが定格(±30)を超えない"""
+        controller, fake = self._start_controller()
+        try:
+            controller.set_look_override((vtube.SCREEN_LOOK_X, vtube.SCREEN_LOOK_Y))
+            for _ in range(3):
+                controller.play_gesture("shake")
+                time.sleep(0.4)
+            angles = [
+                parameter["value"]
+                for request in list(fake.requests)
+                if request.get("messageType") == "InjectParameterDataRequest"
+                for parameter in request["data"]["parameterValues"]
+                if parameter["id"] in ("FaceAngleX", "FaceAngleY", "FaceAngleZ")
+            ]
+            assert angles
+            worst = max(angles, key=abs)
+            assert abs(worst) <= vtube.FACE_ANGLE_LIMIT, f"定格超え: {worst}"
+        finally:
+            controller.stop()
+
+    def test_gesture_moves_the_head_beyond_the_idle_sway(self) -> None:
+        """仕草が待機の揺れを超えて首を動かす（配線）"""
+        controller, fake = self._start_controller()
+        try:
+
+            def face_angle_y():
+                for request in reversed(list(fake.requests)):
+                    if request.get("messageType") != "InjectParameterDataRequest":
+                        continue
+                    for parameter in request["data"]["parameterValues"]:
+                        if parameter["id"] == "FaceAngleY":
+                            return parameter["value"]
+                return None
+
+            assert _wait_until(lambda: face_angle_y() is not None)
+            controller.engine.start_gesture("nod")
+            # calmの揺れ(sway_y+sub_y+呼吸)は最大3.0程度
+            assert _wait_until(
+                lambda: abs(face_angle_y() or 0.0) > 3.5,
+                timeout=2.0,
+            ), "うなずきが首の角度に出ていません"
+        finally:
+            controller.stop()
+
+    def test_face_params_are_sent_with_the_mood(self) -> None:
+        """ムードの眉・口角が実際に送信される（配線）"""
+        controller, fake = self._start_controller()
+        try:
+            controller.set_emotion("amused")
+
+            def sent(name: str):
+                for request in reversed(list(fake.requests)):
+                    if request.get("messageType") != "InjectParameterDataRequest":
+                        continue
+                    for parameter in request["data"]["parameterValues"]:
+                        if parameter["id"] == name:
+                            return parameter["value"]
+                return None
+
+            target = vtube.MOODS["amused"]
+            assert _wait_until(
+                lambda: (sent("MouthSmile") or 0.0) > vtube.FACE_NEUTRAL
+            ), "楽しいときに口角が上がりません"
+            assert _wait_until(
+                lambda: abs((sent("Brows") or 0.0) - target.brows) < 0.1
+            ), "眉がムードの値へ寄りません"
+        finally:
+            controller.stop()
+
     def test_look_override_pins_and_releases_the_gaze(self) -> None:
         """視線を固定でき、解除すれば自動のきょろきょろへ戻る"""
         controller, fake = self._start_controller()
@@ -590,10 +1093,15 @@ class TestControllerIntegration:
         """
         controller, fake = self._start_controller()
         try:
-            # 待機モーションが動き出す＝各ディレクタが待機に入ってから仕掛ける
+            # 待機モーションが動き出す＝各ディレクタが待機に入ってから仕掛ける。
+            # 起動時の割り当て判定も注入を使うので、首の角度が来たかで見分ける
             assert _wait_until(
                 lambda: any(
                     request.get("messageType") == "InjectParameterDataRequest"
+                    and any(
+                        parameter["id"] == "FaceAngleX"
+                        for parameter in request["data"]["parameterValues"]
+                    )
                     for request in list(fake.requests)
                 )
             )

@@ -25,6 +25,9 @@ class _FakeController:
     def set_look_override(self, target) -> None:
         self.calls.append(("look", target))
 
+    def play_gesture(self, name: str) -> None:
+        self.calls.append(("gesture", name))
+
 
 def _run(steps, controller=None):
     controller = controller or _FakeController()
@@ -72,6 +75,18 @@ class TestDemoSteps:
         with pytest.raises(ValueError):
             build_demo_steps(emotion="angry")
 
+    def test_covers_every_gesture(self) -> None:
+        """全ての仕草を1回ずつ確認できる"""
+        played = {step.gesture for step in build_demo_steps() if step.gesture}
+        assert played == set(vtube.GESTURES)
+
+    def test_gesture_steps_name_the_gesture(self) -> None:
+        """仕草ステップは何が起きるかを説明している"""
+        for step in build_demo_steps():
+            if step.gesture:
+                assert step.gesture in vtube.GESTURES
+                assert step.check
+
     def test_every_step_explains_what_to_watch(self) -> None:
         """各ステップに「何を確認するか」が書いてある"""
         for step in build_demo_steps():
@@ -112,6 +127,37 @@ class TestRunSteps:
             ("speaking", False),
         ]
         assert slept == [3.0, 4.0]
+
+    def test_plays_the_gesture_of_a_step(self) -> None:
+        """仕草ステップはコントローラへ仕草を流す（配線）"""
+        steps = [
+            DemoStep(
+                title="うなずき",
+                check="首が縦に振れる",
+                emotion="calm",
+                look=None,
+                speak=False,
+                seconds=2.0,
+                gesture="nod",
+            )
+        ]
+        controller, _ = _run(steps)
+        assert ("gesture", "nod") in controller.calls
+
+    def test_steps_without_a_gesture_do_not_play_one(self) -> None:
+        """仕草を指定しないステップでは仕草を出さない"""
+        steps = [
+            DemoStep(
+                title="待機",
+                check="揺れるだけ",
+                emotion="calm",
+                look=None,
+                speak=False,
+                seconds=1.0,
+            )
+        ]
+        controller, _ = _run(steps)
+        assert not [call for call in controller.calls if call[0] == "gesture"]
 
     def test_mouth_closes_after_each_speaking_step(self) -> None:
         """喋るステップは必ず口を閉じて終わる"""
