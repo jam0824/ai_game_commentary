@@ -1439,6 +1439,17 @@ def build_commentary_prompt(
         "→ extended / 『あ、これ証言と食い違ってるじゃん。"
         "さっきのアリバイ、かなり怪しくなってきたかも。』\n"
         "- 上の言い回しは雰囲気の見本。毎回コピーせず、場面に合わせて変える。\n\n"
+        "# Emotion\n"
+        "- calm: 平常の説明・情景・つなぎ。silentでは必ずこれ。\n"
+        "- amused: 面白い、可愛い、笑える、ニヤッとする場面。\n"
+        "- excited: 明るい急展開、成功、盛り上がり、テンションが上がる発見。"
+        "配信映えするので抑えずに使う。\n"
+        "- surprised: 予想外の出来事、突然の物音、驚きの事実。\n"
+        "- tense: 緊迫、不穏、危険が迫る場面。\n"
+        "- sad: 不憫、切ない、痛ましい、可哀想な出来事。素直に選んでよい。\n"
+        "- thoughtful: 推理、考察、疑問を掘り下げる場面。\n"
+        "- 発話するのにcalmを選ぶのは、本当に平常の内容のときだけ。"
+        "同じ感情ばかりが続くと単調になるので、場面が動いたら感情も動かす。\n\n"
         "# Delivery\n"
         "- emotionは calm/amused/excited/surprised/tense/sad/thoughtful "
         "から選ぶ。silentではcalm。\n"
@@ -1933,13 +1944,22 @@ def verify_choice_speech(
 
 def _notify_vtube_emotion(
     vtube: VTubeStudioController | None,
-    emotion: str,
+    plan: Any,
 ) -> None:
-    """VTubeモデルへ感情を伝える。失敗してもゲーム進行は止めない"""
+    """VTubeモデルへ感情を伝える。失敗してもゲーム進行は止めない
+
+    emotionだけでなく強度と話し方も渡す。同じ感情でも「軽いツッコミ」と
+    「重大発見の絶叫」で動きの大きさが変わるようにするため。
+    modeを持たないプラン（選択・締め）は感情と強度だけ渡る。
+    """
     if vtube is None:
         return
     try:
-        vtube.set_emotion(emotion)
+        vtube.set_emotion(
+            getattr(plan, "emotion", "calm"),
+            intensity=getattr(plan, "intensity", None),
+            mode=getattr(plan, "mode", None),
+        )
     except Exception as exc:
         print(
             f"警告: VTubeモデルへの感情反映に失敗しました: {exc}",
@@ -3371,7 +3391,7 @@ def _deliver_startup_message(
         intensity=0.6,
         pace="normal",
     )
-    _notify_vtube_emotion(vtube, plan.emotion)
+    _notify_vtube_emotion(vtube, plan)
     try:
         speech: SpeechResult | None = None
         speech_prompt = build_commentary_speech_prompt(
@@ -3569,7 +3589,7 @@ def _deliver_closing_message(
         )
 
     print("締めの挨拶を再生しています...")
-    _notify_vtube_emotion(vtube, plan.emotion)
+    _notify_vtube_emotion(vtube, plan)
     try:
         speech = realtime.speak(
             phase="closing",
@@ -4640,7 +4660,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"意見: {choice_plan.opinion}"
                     )
                     print("意見と選択宣言を再生しています...")
-                    _notify_vtube_emotion(vtube, choice_plan.emotion)
+                    _notify_vtube_emotion(vtube, choice_plan)
                     choice_retry_ended_session = False
                     choice_termination_reason: str | None = None
                     try:
@@ -4993,7 +5013,7 @@ def main(argv: list[str] | None = None) -> int:
                         print("このターンは感想なしで進めます。")
                     else:
                         print("実況反応を演技付きで再生しています...")
-                        _notify_vtube_emotion(vtube, commentary_plan.emotion)
+                        _notify_vtube_emotion(vtube, commentary_plan)
                         commentary = realtime.speak(
                             phase="commentary",
                             instructions=build_commentary_speech_prompt(

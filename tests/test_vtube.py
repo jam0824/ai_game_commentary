@@ -281,6 +281,58 @@ class TestIdleWaveform:
             previous = current
 
 
+class TestSurpriseTiming:
+    """驚きの演出と音声のタイミング
+
+    set_emotionは音声の生成前に呼ばれるため、素直に演出すると声が出る頃には
+    驚きが終わっている（実測で中央値0.87秒、2秒超が19%）。
+    """
+
+    def test_burst_restarts_when_the_voice_starts(self) -> None:
+        """喋り始めで驚きの演出を出し直す"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_mood("surprised")
+        for _ in range(int(1.5 * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+        assert engine.burst_strength() == 0.0, "前提: 演出は一度終わっている"
+
+        engine.set_speaking(True)
+        engine.update(1 / vtube.FPS)
+        assert engine.burst_strength() > 0.3, "声に合わせて驚き直していません"
+
+    def test_mood_is_held_while_speaking(self) -> None:
+        """喋っている間は驚きのまま。言い終わる前に平常へ戻らない"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_mood("surprised")
+        engine.set_speaking(True)
+        for _ in range(int(6.0 * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+        assert engine.mood == "surprised"
+
+        engine.set_speaking(False)
+        for _ in range(int(vtube.SURPRISE_HOLD * vtube.FPS) + 2):
+            engine.update(1 / vtube.FPS)
+        assert engine.mood == "calm", "喋り終わっても戻りません"
+
+    def test_other_moods_do_not_burst_when_speaking(self) -> None:
+        """驚き以外は喋り始めても演出が立たない"""
+        engine = vtube.MoodEngine("amused")
+        engine.set_speaking(True)
+        engine.update(1 / vtube.FPS)
+        assert engine.burst_strength() == 0.0
+
+    def test_speaking_does_not_restart_an_old_surprise(self) -> None:
+        """驚きから平常へ戻ったあとの発話では演出しない"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_mood("surprised")
+        for _ in range(int((vtube.SURPRISE_HOLD + 1.0) * vtube.FPS)):
+            engine.update(1 / vtube.FPS)
+        assert engine.mood == "calm"
+        engine.set_speaking(True)
+        engine.update(1 / vtube.FPS)
+        assert engine.burst_strength() == 0.0
+
+
 class TestGestures:
     """単発の仕草（うなずき・首かしげ・首振りなど）"""
 
@@ -362,6 +414,45 @@ class TestGestures:
             for name in weights:
                 assert name in vtube.GESTURES, f"{mood}に未定義の仕草: {name}"
 
+    def test_no_gesture_is_left_unused(self) -> None:
+        """定義した仕草がどこからも呼ばれない状態にしない"""
+        used = set().union(*(set(w) for w in vtube.MOOD_GESTURES.values()))
+        assert set(vtube.GESTURES) <= used, (
+            f"どのムードからも出ない仕草: {sorted(set(vtube.GESTURES) - used)}"
+        )
+
+    def test_no_mood_relies_on_a_single_gesture(self) -> None:
+        """1つの仕草だけに偏らせない（配信中ずっと同じ動きに見えてしまう）"""
+        for mood, weights in vtube.MOOD_GESTURES.items():
+            total = sum(weights.values())
+            top = max(weights.values()) / total
+            assert top <= 0.6, (
+                f"{mood}は{max(weights, key=lambda k: weights[k])}に"
+                f"{top * 100:.0f}%偏っています"
+            )
+
+    def test_gesture_size_follows_the_mood(self) -> None:
+        """静かなムードでは仕草も小さくする（緊迫中に大きく頷かない）"""
+        for name, params in vtube.MOODS.items():
+            assert params.gesture_amp > 0.0, name
+        assert vtube.MOODS["tense"].gesture_amp < vtube.MOODS["calm"].gesture_amp
+        assert vtube.MOODS["excited"].gesture_amp > vtube.MOODS["calm"].gesture_amp
+
+    def test_quiet_moods_still_show_their_gestures(self) -> None:
+        """小さくしても、そのムードの揺れには埋もれない"""
+        for name, params in vtube.MOODS.items():
+            sway = {
+                "x": params.sway_x + params.sub_x,
+                "y": params.sway_y + params.sub_y,
+                "z": params.sway_z + params.sub_z,
+            }
+            for gesture_name in vtube.MOOD_GESTURES[name]:
+                gesture = vtube.GESTURES[gesture_name]
+                peak = abs(gesture.amp) * params.gesture_amp
+                assert peak >= sway[gesture.axis] * 2.0, (
+                    f"{name}の{gesture_name}が揺れに埋もれます: {peak:.1f}度"
+                )
+
     def test_moods_use_different_gestures(self) -> None:
         """ムードごとに出る仕草が違う（沈んだときにうなずかない等）"""
         assert vtube.MOOD_GESTURES["sad"] != vtube.MOOD_GESTURES["excited"]
@@ -394,6 +485,76 @@ class TestGestures:
         engine = vtube.MoodEngine("calm")
         engine.start_gesture("moonwalk")
         assert engine.gesture_angles() == (0.0, 0.0, 0.0)
+
+
+class TestIntensityAndMode:
+    """実況プランの intensity / mode をモーションへ反映する"""
+
+    def test_intensity_scales_the_gesture(self) -> None:
+        """強度が高いほど仕草が大きくなる"""
+        weak = vtube.MoodEngine("calm")
+        weak.set_intensity(0.0)
+        strong = vtube.MoodEngine("calm")
+        strong.set_intensity(1.0)
+        for engine in (weak, strong):
+            engine.start_gesture("nod")
+            engine.update(vtube.GESTURES["nod"].seconds * 0.5)
+        assert abs(strong.gesture_angles()[1]) > abs(weak.gesture_angles()[1])
+
+    def test_intensity_is_clamped(self) -> None:
+        """範囲外の強度が来ても暴れない"""
+        engine = vtube.MoodEngine("calm")
+        engine.set_intensity(9.9)
+        engine.start_gesture("nod")
+        engine.update(vtube.GESTURES["nod"].seconds * 0.5)
+        assert abs(engine.gesture_angles()[1]) <= abs(vtube.GESTURES["nod"].amp) * (
+            vtube.INTENSITY_AMP_MAX + 1e-9
+        )
+        engine.set_intensity(-5.0)
+        assert engine.intensity == 0.0
+
+    def test_default_intensity_keeps_the_original_size(self) -> None:
+        """強度の指定がないときは今までどおりの大きさ"""
+        engine = vtube.MoodEngine("calm")
+        engine.start_gesture("tilt")
+        engine.update(vtube.GESTURES["tilt"].seconds * 0.5)
+        assert engine.gesture_angles()[2] == pytest.approx(
+            vtube.GESTURES["tilt"].amp * vtube.MOODS["calm"].gesture_amp,
+            abs=0.01,
+        )
+
+    def test_mood_scales_the_gesture_too(self) -> None:
+        """同じ仕草でも、静かなムードでは小さく出る"""
+        calm = vtube.MoodEngine("calm")
+        tense = vtube.MoodEngine("tense")
+        for engine in (calm, tense):
+            engine.start_gesture("tilt")
+            engine.update(vtube.GESTURES["tilt"].seconds * 0.5)
+        assert abs(tense.gesture_angles()[2]) < abs(calm.gesture_angles()[2])
+
+    def test_intensity_shortens_the_gesture_interval(self) -> None:
+        """強度が高いほど仕草の間隔が詰まる"""
+        assert vtube.gesture_interval_scale(1.0) < vtube.gesture_interval_scale(0.0)
+
+    def test_mode_biases_the_reaction_gesture(self) -> None:
+        """modeで反応の仕草の傾向が変わる"""
+        assert set(vtube.MODE_GESTURE_BIAS) >= {"reaction", "quick", "extended"}
+        for mode, bias in vtube.MODE_GESTURE_BIAS.items():
+            for name in bias:
+                assert name in vtube.GESTURES, f"{mode}に未定義の仕草: {name}"
+
+        counts: dict[str, int] = {}
+        bias = vtube.MODE_GESTURE_BIAS["reaction"]
+        for _ in range(3000):
+            name = vtube.pick_gesture("amused", random, bias)
+            counts[name] = counts.get(name, 0) + 1
+        # 反射的な反応では、うなずきより「え？」という首かしげ・首振りが出る
+        assert counts.get("tilt", 0) > counts.get("nod", 0), counts
+
+    def test_unknown_mode_falls_back_to_the_mood_weights(self) -> None:
+        """未知のmodeでも仕草が出る"""
+        name = vtube.pick_gesture("calm", random, vtube.MODE_GESTURE_BIAS.get("silent"))
+        assert name in vtube.MOOD_GESTURES["calm"]
 
 
 class TestBlinkTiming:
@@ -620,6 +781,14 @@ class TestGazePatterns:
             assert weights, mood
             for name in weights:
                 assert name in vtube.GAZE_PATTERNS, f"{mood}に未定義: {name}"
+
+    def test_no_gaze_pattern_is_left_unused(self) -> None:
+        """定義した視線パターンがどこからも呼ばれない状態にしない"""
+        used = set().union(*(set(w) for w in vtube.MOOD_GAZE.values()))
+        assert set(vtube.GAZE_PATTERNS) <= used, (
+            f"どのムードからも出ないパターン: "
+            f"{sorted(set(vtube.GAZE_PATTERNS) - used)}"
+        )
 
     def test_double_take_looks_back_at_the_screen(self) -> None:
         """二度見は 画面→正面→もう一度画面 の順に動く"""
@@ -981,6 +1150,48 @@ class TestControllerIntegration:
             assert _wait_until(
                 lambda: (sent("FaceAngleZ") or 0.0) <= -3.5
             ), "振り向きに首の傾きが連動していません"
+        finally:
+            controller.stop()
+
+    def test_emotion_carries_intensity_and_mode(self) -> None:
+        """実況プランの強度とモードがエンジンまで届く（配線）"""
+        controller, _fake = self._start_controller()
+        try:
+            controller.set_emotion("excited", intensity=0.9, mode="extended")
+            assert _wait_until(lambda: controller.engine.intensity == 0.9)
+            assert controller.engine.mode == "extended"
+
+            # 指定なしでも従来どおり動く
+            controller.set_emotion("calm")
+            assert _wait_until(lambda: controller.engine.mood == "calm")
+        finally:
+            controller.stop()
+
+    def test_surprise_replays_with_the_voice(self) -> None:
+        """生成待ちで演出が終わっても、声が出るときに驚き直す（配線）"""
+        controller, fake = self._start_controller()
+        try:
+
+            def face_angle_y():
+                for request in reversed(list(fake.requests)):
+                    if request.get("messageType") != "InjectParameterDataRequest":
+                        continue
+                    for parameter in request["data"]["parameterValues"]:
+                        if parameter["id"] == "FaceAngleY":
+                            return parameter["value"]
+                return None
+
+            assert _wait_until(lambda: face_angle_y() is not None)
+            controller.set_emotion("surprised")
+            # 音声生成に手間取り、演出が終わってしまった状況を作る
+            time.sleep(1.5)
+            controller.set_speaking(True)
+            # surprisedの揺れ+視線バイアスは最大2.6程度。それを超える分がのけぞり
+            assert _wait_until(
+                lambda: (face_angle_y() or 0.0) > 3.5,
+                timeout=1.5,
+            ), "声に合わせてのけぞり直していません"
+            controller.set_speaking(False)
         finally:
             controller.stop()
 

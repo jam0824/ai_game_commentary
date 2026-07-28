@@ -189,6 +189,7 @@ class MoodParams:
     brows: float           # 眉の高さ(0.5=中立、下げると寄る)
     gesture_min: float     # 単発の仕草を出す間隔
     gesture_max: float
+    gesture_amp: float     # 仕草の大きさ倍率(静かなムードでは小さく出す)
     period_x: float        # 首の揺れ 主波の周期(秒)。軸ごとに変えると動きに癖が出る
     period_y: float
     period_z: float
@@ -261,6 +262,7 @@ MOODS = {
         mouth_smile=0.45, brows=0.5,
         gesture_min=8.0, gesture_max=18.0,
         period_x=7.3, period_y=5.7, period_z=9.1,
+        gesture_amp=1.0,
     ),
     # 笑ってる・楽しんでる。表情は素の顔のまま少し弾む
     "amused": MoodParams(
@@ -277,6 +279,7 @@ MOODS = {
         mouth_smile=0.70, brows=0.60,
         gesture_min=5.0, gesture_max=12.0,
         period_x=5.9, period_y=3.8, period_z=7.3,
+        gesture_amp=1.15,
     ),
     # 大興奮。振幅も速さも大きく、前のめり
     "excited": MoodParams(
@@ -293,6 +296,7 @@ MOODS = {
         mouth_smile=0.62, brows=0.78,
         gesture_min=4.0, gesture_max=9.0,
         period_x=6.3, period_y=4.4, period_z=5.1,
+        gesture_amp=1.5,
     ),
     # 驚き。持続状態としては「固まってる」。演出は別途バーストで乗る
     "surprised": MoodParams(
@@ -310,6 +314,7 @@ MOODS = {
         mouth_smile=0.50, brows=0.85,
         gesture_min=6.0, gesture_max=14.0,
         period_x=6.8, period_y=8.2, period_z=9.6,
+        gesture_amp=1.0,
     ),
     # 緊張・集中(thoughtfulもここへ割り当てる)。画面から目を離さず、細かく震える
     "tense": MoodParams(
@@ -327,6 +332,7 @@ MOODS = {
         mouth_smile=0.35, brows=0.30,
         gesture_min=8.0, gesture_max=20.0,
         period_x=5.2, period_y=6.9, period_z=8.4,
+        gesture_amp=0.6,
     ),
     # 落ち込み。半目・下向き・動きが重い
     "sad": MoodParams(
@@ -344,6 +350,7 @@ MOODS = {
         mouth_smile=0.20, brows=0.38,
         gesture_min=10.0, gesture_max=24.0,
         period_x=8.1, period_y=6.2, period_z=11.3,
+        gesture_amp=0.8,
     ),
 }
 
@@ -374,14 +381,32 @@ GESTURES = {
 
 # ムードごとに出る仕草と、その出やすさ。
 # 補間はしない(仕草は抽選した瞬間に決まる離散的なもの)ので MoodParams とは別表
+# 1つの仕草へ寄せすぎると、そのムードの間ずっと同じ動きに見える。
+# 特に tense は配信時間の半分を占めるので、種類を散らしておく
 MOOD_GESTURES = {
-    "calm": {"nod": 1.0, "tilt": 0.6},
-    "amused": {"nod": 2.0, "tilt": 1.0, "shake": 0.5},
-    "excited": {"nod": 3.0, "shake": 0.8, "lean_in": 1.0},
-    "surprised": {"lean_in": 1.0, "tilt": 0.5},
-    "tense": {"lean_in": 1.5, "tilt": 0.3},
-    "sad": {"droop": 2.0, "shake": 0.6, "tilt": 0.4},
+    "calm": {"nod": 1.0, "tilt": 0.8, "shake": 0.3},
+    "amused": {"nod": 1.5, "tilt": 1.0, "shake": 0.5},
+    "excited": {"nod": 2.0, "shake": 0.8, "lean_in": 1.2},
+    "surprised": {"lean_in": 1.0, "tilt": 0.8},
+    "tense": {"lean_in": 1.0, "tilt": 0.8, "nod": 0.5, "shake": 0.3},
+    "sad": {"droop": 1.5, "shake": 0.6, "tilt": 0.8},
 }
+
+# 実況プランの mode ごとに出やすくする仕草の倍率。
+# 反射的な反応(reaction)は「え？」という首かしげ・首振り、じっくり話す
+# (extended)は相槌のうなずきや前のめり、というように傾向を分ける
+MODE_GESTURE_BIAS = {
+    "reaction": {"tilt": 3.0, "shake": 2.0, "nod": 0.4},
+    "quick": {"nod": 1.5, "tilt": 1.0},
+    "extended": {"nod": 2.0, "lean_in": 1.5, "shake": 0.7},
+}
+
+# 実況プランの intensity(0〜1) を仕草の大きさ・間隔へ変換する範囲。
+# 強度0でも動きを止めず、強度1でも暴れすぎない幅にする
+INTENSITY_AMP_MIN = 0.7
+INTENSITY_AMP_MAX = 1.3
+INTENSITY_INTERVAL_MIN = 0.7
+INTENSITY_INTERVAL_MAX = 1.3
 
 # 仕草の立ち上がり・戻りにかける割合。
 # EASE は姿勢を保つ仕草(首かしげなど)、EDGE_FADE は往復する仕草の端の丸め。
@@ -426,9 +451,33 @@ def gesture_offset(gesture: Gesture, progress: float) -> float:
     return gesture.amp * ease
 
 
-def pick_gesture(mood: str, rng) -> str:
-    """そのムードで出る仕草を重み付きで選ぶ"""
+def gesture_amp_scale(intensity: float) -> float:
+    """強度から仕草の大きさの倍率"""
+    ratio = clamp(intensity, 0.0, 1.0)
+    return INTENSITY_AMP_MIN + (INTENSITY_AMP_MAX - INTENSITY_AMP_MIN) * ratio
+
+
+def gesture_interval_scale(intensity: float) -> float:
+    """強度から仕草の間隔の倍率(高いほど詰まる)"""
+    ratio = clamp(intensity, 0.0, 1.0)
+    return INTENSITY_INTERVAL_MAX - (
+        INTENSITY_INTERVAL_MAX - INTENSITY_INTERVAL_MIN
+    ) * ratio
+
+
+def pick_gesture(mood: str, rng, bias: dict[str, float] | None = None) -> str:
+    """そのムードで出る仕草を重み付きで選ぶ
+
+    bias を渡すと、実況の mode に合わせて出やすさを傾ける。
+    ムードに無い仕草は bias があっても出さない(ムードの性格を壊さないため)。
+    """
     weights = MOOD_GESTURES.get(mood) or MOOD_GESTURES["calm"]
+    if bias:
+        weights = {
+            name: weight * bias.get(name, 1.0) for name, weight in weights.items()
+        }
+        if not any(weights.values()):
+            weights = MOOD_GESTURES.get(mood) or MOOD_GESTURES["calm"]
     total = sum(weights.values())
     threshold = rng.random() * total
     upto = 0.0
@@ -781,6 +830,15 @@ class MoodEngine:
         self._gesture_t = 0.0
         # ムードの配合。今のムードへ 1.0 で寄っていく(表情の濃さに使う)
         self.mix = {name: (1.0 if name == self.mood else 0.0) for name in MOODS}
+        self.speaking = False
+        # 実況プランの強度とモード。仕草の大きさ・間隔・傾向に効く。
+        # 0.5 が素の大きさ(倍率1.0)で、そこから上下する
+        self.intensity = 0.5
+        self.mode: str | None = None
+
+    def set_intensity(self, intensity: float) -> None:
+        """実況プランの強度(0〜1)を反映する"""
+        self.intensity = clamp(float(intensity), 0.0, 1.0)
 
     def set_mood(self, name: str, hold: float | None = None) -> None:
         """ムードを切り替える。hold を渡すとその秒数後に元のムードへ戻る"""
@@ -804,6 +862,18 @@ class MoodEngine:
 
         self.mood = name
 
+    def set_speaking(self, speaking: bool) -> None:
+        """発話の開始・終了を伝える
+
+        set_emotion は音声の「生成前」に呼ばれるので、驚きの演出をそのまま流すと
+        声が出る頃には終わっている。喋り始めで演出を出し直し、喋っている間は
+        元のムードへ戻さないようにする。
+        """
+        speaking = bool(speaking)
+        if speaking and not self.speaking and self.mood == "surprised":
+            self._burst_t = 0.0
+        self.speaking = speaking
+
     def start_gesture(self, name: str) -> None:
         """単発の仕草を積む。実行中の仕草は差し替える
 
@@ -820,8 +890,11 @@ class MoodEngine:
         """実行中の仕草による (x, y, z) の加算量"""
         if self._gesture is None:
             return 0.0, 0.0, 0.0
-        offset = gesture_offset(
-            self._gesture, self._gesture_t / self._gesture.seconds
+        # ムードの落ち着き(params.gesture_amp)と実況の強度の両方で大きさを決める
+        offset = (
+            gesture_offset(self._gesture, self._gesture_t / self._gesture.seconds)
+            * self.params.gesture_amp
+            * gesture_amp_scale(self.intensity)
         )
         if self._gesture.axis == "x":
             return offset, 0.0, 0.0
@@ -831,8 +904,10 @@ class MoodEngine:
 
     def update(self, dt: float) -> None:
         """dt 秒ぶん時間を進める。パラメータ補間と位相の更新はここだけ"""
-        # 一時ムード(驚きなど)の残り時間を消化して元へ戻す
-        if self._hold_left > 0.0:
+        # 一時ムード(驚きなど)の残り時間を消化して元へ戻す。
+        # 喋っている間は止めておく。言い終わる前に平常へ戻ると、
+        # 「うわっ!」と言いながら素の顔という食い違いが起きる
+        if self._hold_left > 0.0 and not self.speaking:
             self._hold_left -= dt
             if self._hold_left <= 0.0:
                 self._hold_left = 0.0
@@ -959,14 +1034,31 @@ class VTubeStudioController:
         )
         return True
 
-    def set_emotion(self, emotion: str) -> None:
-        """実況プランのemotionをモーションへ反映する"""
+    def set_emotion(
+        self,
+        emotion: str,
+        intensity: float | None = None,
+        mode: str | None = None,
+    ) -> None:
+        """実況プランの emotion / intensity / mode をモーションへ反映する
+
+        intensity は仕草の大きさと間隔、mode は感情が動いた直後に出る仕草の
+        傾向に効く。省略した場合は前の値のまま。
+        """
         mood = resolve_emotion_mood(emotion)
+
+        def apply() -> None:
+            if intensity is not None:
+                self.engine.set_intensity(intensity)
+            if mode is not None:
+                self.engine.mode = str(mode).strip().casefold()
+            self.engine.set_mood(mood)
+
         loop = self._loop
         if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(self.engine.set_mood, mood)
+            loop.call_soon_threadsafe(apply)
         else:
-            self.engine.set_mood(mood)
+            apply()
 
     def play_gesture(self, name: str) -> None:
         """単発の仕草(うなずきなど)をその場で出す"""
@@ -989,10 +1081,18 @@ class VTubeStudioController:
         self.state["look_override"] = (float(x), float(y))
 
     def set_speaking(self, speaking: bool) -> None:
-        """音声再生中フラグ。Trueの間だけ口パクする"""
+        """音声再生中フラグ。Trueの間だけ口パクする
+
+        口パクだけでなく、驚きの演出を声に合わせ直すためにも使う。
+        """
         self.state["is_speaking"] = bool(speaking)
         if not speaking:
             self.state["mouth_open"] = 0.0
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self.engine.set_speaking, bool(speaking))
+        else:
+            self.engine.set_speaking(bool(speaking))
 
     def stop(self, timeout: float = 3.0) -> None:
         """モーションを止め、表情をリセットして切断する"""
@@ -1499,12 +1599,18 @@ class VTubeStudioController:
         """
         while True:
             p = self.engine.params
+            bias = None
             if await self.wait_for_mood_change(
                 random.uniform(p.gesture_min, p.gesture_max)
+                * gesture_interval_scale(self.engine.intensity)
             ):
-                # 感情が動いた直後は、その感情らしい仕草で反応する
+                # 感情が動いた直後は、その感情らしい仕草で反応する。
+                # 話し方(mode)に合わせて出す仕草も傾ける
                 await asyncio.sleep(random.uniform(*REACTION_GESTURE_DELAY))
-            self.engine.start_gesture(pick_gesture(self.engine.mood, random))
+                bias = MODE_GESTURE_BIAS.get(self.engine.mode or "")
+            self.engine.start_gesture(
+                pick_gesture(self.engine.mood, random, bias)
+            )
 
     async def _mouth_director(self) -> None:
         """喋っている間だけ口をパクパクさせる

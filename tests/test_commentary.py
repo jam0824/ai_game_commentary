@@ -717,3 +717,29 @@ def test_speak_keeps_mouth_closed_until_first_audio(
         "音声が届く前に口パクを開始しています"
     )
     assert events == [True, False]
+
+
+def test_commentary_prompt_explains_when_to_use_each_emotion() -> None:
+    """感情ごとの使いどころを示し、calm/amusedへの偏りを減らす
+
+    過去1077ターンの記録ではexcitedが8回・sadが5回しか選ばれておらず、
+    列挙するだけでは無難な感情に寄ってしまうため。
+    """
+    prompt = commentary_module.build_commentary_prompt("背後で物音がした。")
+    for emotion in (
+        "calm",
+        "amused",
+        "excited",
+        "surprised",
+        "tense",
+        "sad",
+        "thoughtful",
+    ):
+        assert f"{emotion}:" in prompt, f"{emotion}の使いどころが書かれていません"
+
+
+def test_commentary_prompt_discourages_defaulting_to_calm() -> None:
+    """発話するのにcalmを選び続けない指示が入っている"""
+    prompt = commentary_module.build_commentary_prompt("犯人が分かった。")
+    assert "calm" in prompt
+    assert "同じ感情" in prompt or "偏ら" in prompt
