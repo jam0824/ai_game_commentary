@@ -4124,9 +4124,10 @@ def main(argv: list[str] | None = None) -> int:
             ocr_engine = PersistentNdlOcr()
             print(f"NDLOCR初期化: {ocr_engine.initialization_seconds:.3f}秒")
         commentary_model = args.commentary_model
-        session_started_at = _wait_for_commentary_start(obs_window)
-        print(f"Realtime音声へ接続: {args.model} / voice={args.voice}")
         with ExitStack() as stack:
+            # VTube Studioの接続と初期設定は「開始」を押す前に済ませる。
+            # パラメータの割り当て確認でモデルの表情を一瞬振るので、
+            # 録画開始後にやると変顔が録画に入ってしまう
             vtube: VTubeStudioController | None = None
             if not args.no_vtube:
                 vtube = VTubeStudioController()
@@ -4135,6 +4136,8 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     # 接続失敗の警告はコントローラ側が表示済み。実況は継続する
                     vtube = None
+            session_started_at = _wait_for_commentary_start(obs_window)
+            print(f"Realtime音声へ接続: {args.model} / voice={args.voice}")
             realtime = stack.enter_context(
                 RealtimeSpeechClient(
                     api_key=api_key,

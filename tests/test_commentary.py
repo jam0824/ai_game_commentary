@@ -1,4 +1,5 @@
 import base64
+import inspect
 
 import pytest
 
@@ -743,3 +744,18 @@ def test_commentary_prompt_discourages_defaulting_to_calm() -> None:
     prompt = commentary_module.build_commentary_prompt("犯人が分かった。")
     assert "calm" in prompt
     assert "同じ感情" in prompt or "偏ら" in prompt
+
+
+def test_vtube_is_prepared_before_waiting_for_the_start_button() -> None:
+    """VTSの初期設定を「開始」待ちより前に済ませる
+
+    感情パラメータの割り当て確認でモデルの表情を一瞬振るため、開始ボタン
+    （＝録画開始）より後にやると変顔が録画に入ってしまう。順序が入れ替わっても
+    テストが落ちないと気づけないので、ここで固定する。
+    """
+    source = inspect.getsource(commentary_module.main)
+    started = source.index("vtube.start()")
+    waited = source.index("_wait_for_commentary_start(")
+    assert started < waited, (
+        "VTube Studioの初期化が「開始」待ちより後になっています"
+    )
