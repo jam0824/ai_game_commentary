@@ -268,6 +268,17 @@ VTube Studioが起動していない場合や接続を拒否された場合は�
 感情は次に感想を話すまで維持され、`surprised` だけは演出の直後に元のムードへ
 戻ります。ゲーム本文の朗読中は直前の感情のまま口パクします。
 
+モーションの見た目だけを確認したいときは、ゲームを起動せずにデモを流せます。
+
+```powershell
+uv run game-vtube-demo             # 待機・チラ見・全感情・口パクを一通り
+uv run game-vtube-demo --list      # 手順の確認だけ（VTSへ接続しない）
+uv run game-vtube-demo --emotion sad --loop  # 特定の感情だけ繰り返す
+```
+
+各ステップで「何が起きるべきか」を表示するので、モーションの数値を調整した
+あとの確認に使えます。`--hold` で1ステップの秒数を変えられます（既定6秒）。
+
 呼吸は VTube Studio の既定パラメータに入口がないため、起動時に `Breath` という
 カスタム入力パラメータを自動生成します。実際に動かすには、VTube Studio の
 model config タブ内 `VTS Parameter Setup` で、呼吸用のLive2Dパラメータ

@@ -44,19 +44,35 @@ SURPRISE_LIFT = 3.0    # 一瞬のけぞる量(Y)
 LOOK_Y_SIGN = 1.0
 
 # ゲーム画面の方向。キャラは配信画面の右下に立つので、画面は「向かって左上」にある。
-# 逆を向いたら符号を反転する
-SCREEN_LOOK_X = -14.0  # 左
-SCREEN_LOOK_Y = 7.0    # 上
-SCREEN_JITTER = 2.0    # チラ見のたびに少しズラす(毎回同じ点を見ると機械的)
+# 逆を向いたら符号を反転する。
+# 配信画面ではキャラが小さく映るので、はっきり首を振らないと「画面を見た」ことが
+# 伝わらない。VTS の FaceAngle は ±30 が定格なので、その範囲で大きめに取る
+SCREEN_LOOK_X = -24.0  # 左
+SCREEN_LOOK_Y = 9.0    # 上
+SCREEN_JITTER = 3.0    # チラ見のたびに少しズラす(毎回同じ点を見ると機械的)
 
-# 首の狙い位置に追いつく速さ。大きいほどキビキビ視線が動く
-LOOK_FOLLOW_RATE = 2.2
+# 待機位置を画面側へ寄せる量の上限。
+# チラ見を大きくしたぶん、これを掛けずに寄せると横を向いたまま固定されてしまう
+REST_LEAN_MAX = 0.3
+
+# 首の狙い位置に追いつく速さ。大きいほどキビキビ視線が動く。
+# 振り幅を大きくしたので、鈍く見えないよう合わせて上げている
+LOOK_FOLLOW_RATE = 2.8
+
+# 振り向きに連動する首の傾き(Z)。
+# 人は横を向くとき首も向いた側へ傾く。首の角度をそのまま平行移動させるだけだと
+# 「顔が横にスライドした」ように見えるので、傾きを足して振り向きらしさを出す。
+# 傾く向きが逆に見えるなら符号を反転する
+LOOK_TO_TILT = 0.28
+LOOK_TILT_MAX = 8.0
 
 # 首の角度を目線に変換する係数。
 # 人は視線を動かすとき目が先に動き、首が後から追いつく。EYE_LEAD が「まだ首が
 # 向いていない分を目で先行する量」、EYE_HOLD が「首の向きに合わせた定常のズレ」。
-EYE_LEAD = 0.075
-EYE_HOLD = 0.030
+# 大きく振り向くようになったぶん、上げすぎると目が -1 に振り切れたまま固まり、
+# 首が到着しても横目のままになる。首が着いたら目は中央側へ戻す値にしている
+EYE_LEAD = 0.05
+EYE_HOLD = 0.02
 
 # 呼吸を流し込むための入力パラメータ名。
 # VTube Studio の既定パラメータには呼吸用が無いので、起動時にカスタム入力
@@ -262,6 +278,15 @@ def eye_look_offset(head: float, residual: float) -> float:
     return clamp(head * EYE_HOLD + residual * EYE_LEAD, -1.0, 1.0)
 
 
+def vertical_gaze(head: float, residual: float) -> tuple[float, float]:
+    """上下方向の (首の角度, 目線) を返す
+
+    LOOK_Y_SIGN をどちらにも同じように掛けるための入口。首だけ反転させると
+    「顔は上、目は下」というちぐはぐな向きになるので、ここで揃えておく。
+    """
+    return head * LOOK_Y_SIGN, eye_look_offset(head, residual) * LOOK_Y_SIGN
+
+
 def input_parameter_names(response: Any) -> set[str]:
     """InputParameterListRequest のレスポンスからパラメータ名を集める
 
@@ -306,10 +331,15 @@ def rest_look_target(params: MoodParams, rng) -> tuple[float, float]:
     そうしないとチラ見のあと毎回カメラ目線に戻ってしまい、
     「画面に集中している」感じが消える。
     """
-    lean = params.screen_glance_chance * 0.5
+    lean = min(params.screen_glance_chance * 0.5, REST_LEAN_MAX)
     x = SCREEN_LOOK_X * lean + rng.uniform(-1.5, 1.5)
     y = SCREEN_LOOK_Y * lean + rng.uniform(-1.0, 1.0)
     return x, y
+
+
+def turn_tilt(head_x: float) -> float:
+    """振り向いた角度に対して、連動して首を傾ける量(Z)"""
+    return clamp(head_x * LOOK_TO_TILT, -LOOK_TILT_MAX, LOOK_TILT_MAX)
 
 
 def idle_angles(
@@ -507,6 +537,8 @@ class VTubeStudioController:
             "is_speaking": False,
             "look_x": 0.0,       # 視線・首の狙い位置(ゆっくり動く目標値)
             "look_y": 0.0,
+            # (x, y) を入れている間は自動のきょろきょろを止めてそこを見続ける
+            "look_override": None,
         }
         # 起動時の確認で埋まる。モデル/VTS に無いものは送らない
         self.runtime: dict[str, Any] = {
@@ -555,6 +587,18 @@ class VTubeStudioController:
             loop.call_soon_threadsafe(self.engine.set_mood, mood)
         else:
             self.engine.set_mood(mood)
+
+    def set_look_override(self, target: tuple[float, float] | None) -> None:
+        """視線の狙いを固定する。None を渡すと自動のきょろきょろへ戻る
+
+        角度はムードごとの基準位置(look_bias)を足さない絶対値。
+        動作確認用スクリプトのように、狙った向きを確実に見せたいときに使う。
+        """
+        if target is None:
+            self.state["look_override"] = None
+            return
+        x, y = target
+        self.state["look_override"] = (float(x), float(y))
 
     def set_speaking(self, speaking: bool) -> None:
         """音声再生中フラグ。Trueの間だけ口パクする"""
@@ -813,8 +857,12 @@ class VTubeStudioController:
             sway_x, sway_y, sway_z, breath = self.engine.angles()
 
             # look_x/y に近づける(イージング)。テンションが高いほど機敏に
-            aim_x = self.state["look_x"] + p.look_bias_x
-            aim_y = self.state["look_y"] + p.look_bias_y
+            override = self.state["look_override"]
+            if override is None:
+                aim_x = self.state["look_x"] + p.look_bias_x
+                aim_y = self.state["look_y"] + p.look_bias_y
+            else:
+                aim_x, aim_y = override
             follow = 1.0 - math.exp(-dt * LOOK_FOLLOW_RATE * p.speed)
             cur_x += (aim_x - cur_x) * follow
             cur_y += (aim_y - cur_y) * follow
@@ -830,13 +878,15 @@ class VTubeStudioController:
             )
             # 首がまだ向いていない分(aim - cur)を目で先行させる
             eye_x = eye_look_offset(cur_x, aim_x - cur_x)
-            eye_y = eye_look_offset(cur_y, aim_y - cur_y)
+            # 上下は首と目の向きを揃える。揺れと呼吸は目線に乗せない
+            # (呼吸のたびに目玉が上下すると落ち着かない)
+            look_y, eye_y = vertical_gaze(cur_y, aim_y - cur_y)
 
             params = list(FACE_PARAMS)
             values = [
                 sway_x + cur_x,
-                (sway_y + cur_y + breath_y) * LOOK_Y_SIGN,
-                sway_z,
+                look_y + (sway_y + breath_y) * LOOK_Y_SIGN,
+                sway_z + turn_tilt(cur_x),
                 eye, eye,
                 # 目線も首の動きに連動させると生きてる感が出る
                 eye_x, eye_x, eye_y, eye_y,
@@ -885,6 +935,10 @@ class VTubeStudioController:
         while True:
             p = self.engine.params
             await asyncio.sleep(random.uniform(p.look_min, p.look_max))
+
+            if self.state["look_override"] is not None:
+                # 視線を固定中は自動のきょろきょろを出さない
+                continue
 
             p = self.engine.params
             x, y, hold = pick_look_target(p, random)

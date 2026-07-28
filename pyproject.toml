@@ -19,6 +19,7 @@ dependencies = [
 game-ocr = "game_window_ocr.cli:main"
 game-commentary = "game_window_ocr.commentary:main"
 game-memory-rollback = "game_window_ocr.memory_rollback:main"
+game-vtube-demo = "game_window_ocr.vtube_demo:main"
 
 [dependency-groups]
 dev = [
