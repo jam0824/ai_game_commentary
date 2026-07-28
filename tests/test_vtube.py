@@ -387,7 +387,7 @@ class TestGestures:
 
     def test_every_swing_is_visible(self) -> None:
         """往復のどの振りも見える大きさになる（最初と最後だけ削られない）"""
-        for name, expected in (("nod", 3), ("shake", 5)):
+        for name, expected in (("nod", 3), ("shake", 2)):
             gesture = vtube.GESTURES[name]
             values = [vtube.gesture_offset(gesture, s / 500) for s in range(501)]
             big = 0

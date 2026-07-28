@@ -373,7 +373,11 @@ class Gesture:
 # 揺れと同じくらいだと、何かしたのか分からない動きになる
 GESTURES = {
     "nod": Gesture(axis="y", amp=-12.0, seconds=0.9, cycles=1.5),    # うなずき
-    "shake": Gesture(axis="x", amp=9.0, seconds=1.0, cycles=2.5),    # 首を振る
+    # 速く振ると「いいえ」になる。仕草は発話内容と連動せず抽選で出るので、
+    # 否定に読める動きは肯定的なセリフとぶつかる。「否定」と「感嘆」を分けるのは
+    # 主に速さなので、ゆっくり振って「いやー…」「まいったな」に寄せる。
+    # 振幅は下げられない(excited の待機の揺れに埋もれる)ので、速度だけを落とす
+    "shake": Gesture(axis="x", amp=9.0, seconds=1.8, cycles=1.2),    # 首を振る
     "tilt": Gesture(axis="z", amp=9.0, seconds=2.6),                 # 首かしげ
     "lean_in": Gesture(axis="y", amp=-7.0, seconds=2.2),             # 前のめり
     "droop": Gesture(axis="y", amp=-8.0, seconds=3.2),               # うなだれる
@@ -393,10 +397,11 @@ MOOD_GESTURES = {
 }
 
 # 実況プランの mode ごとに出やすくする仕草の倍率。
-# 反射的な反応(reaction)は「え？」という首かしげ・首振り、じっくり話す
+# 反射的な反応(reaction)は「え？」という首かしげ、じっくり話す
 # (extended)は相槌のうなずきや前のめり、というように傾向を分ける
 MODE_GESTURE_BIAS = {
-    "reaction": {"tilt": 3.0, "shake": 2.0, "nod": 0.4},
+    # reaction の「え？」は tilt で足りる。遅くした shake を重ねると反応が鈍く見える
+    "reaction": {"tilt": 3.0, "shake": 1.0, "nod": 0.4},
     "quick": {"nod": 1.5, "tilt": 1.0},
     "extended": {"nod": 2.0, "lean_in": 1.5, "shake": 0.7},
 }
