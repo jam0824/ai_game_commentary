@@ -58,6 +58,8 @@ COMMENTARY_COMPACT_THRESHOLD = 200_000
 FUZZY_PREFIX_MIN_CHARS = 12
 FUZZY_PREFIX_MIN_COVERAGE = 0.8
 FUZZY_PREFIX_MAX_ERROR_RATE = 0.12
+LINE_DIFF_MATCH_RATIO = 0.8
+LINE_DIFF_MIN_PREVIOUS_COVERAGE = 0.6
 COMMENTARY_PLAN_REVISIONS = 3
 CHOICE_PLAN_REVISIONS = 3
 OCR_INTERVAL = 0.5
@@ -1826,7 +1828,87 @@ def _fuzzy_prefix_end(prefix: str, text: str) -> int | None:
     return best_end
 
 
-def extract_incremental_text(previous_text: str | None, current_text: str) -> str:
+def _screen_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _compact_line(line: str) -> str:
+    return "".join(char for char in line if not char.isspace())
+
+
+def _same_screen_line(first: str, second: str) -> bool:
+    """Judge whether two OCR lines render the same sentence."""
+    left = _compact_line(first)
+    right = _compact_line(second)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return SequenceMatcher(None, left, right).ratio() >= LINE_DIFF_MATCH_RATIO
+
+
+def _appended_lines(previous_text: str, current_text: str) -> str | None:
+    """Collect current lines absent from the previous screen, ignoring order.
+
+    NDLOCR reorders vertical-text lines between captures, which breaks the
+    prefix comparisons above even though the page merely gained a line. Diffing
+    per line instead of per character survives that shuffle.
+    """
+    previous_lines = _screen_lines(previous_text)
+    current_lines = _screen_lines(current_text)
+    if not previous_lines or not current_lines:
+        return None
+
+    unmatched_previous = list(previous_lines)
+    appended: list[str] = []
+    for current_line in current_lines:
+        match_index = next(
+            (
+                index
+                for index, previous_line in enumerate(unmatched_previous)
+                if _same_screen_line(previous_line, current_line)
+            ),
+            None,
+        )
+        if match_index is None:
+            appended.append(current_line)
+        else:
+            unmatched_previous.pop(match_index)
+
+    matched_previous = len(previous_lines) - len(unmatched_previous)
+    coverage = matched_previous / len(previous_lines)
+    if coverage < LINE_DIFF_MIN_PREVIOUS_COVERAGE:
+        # Too little carried over to call this the same page; the screen most
+        # likely turned over, so let the caller fall back to the whole text.
+        return None
+    if not appended:
+        return None
+    return "".join(appended).strip()
+
+
+def _drop_spoken_lines(current_text: str, spoken_text: str | None) -> str | None:
+    """Remove lines already narrated on this page from the fallback text."""
+    if not spoken_text:
+        return None
+    compact_spoken = _compact_line(spoken_text)
+    if not compact_spoken:
+        return None
+    remaining = [
+        line
+        for line in _screen_lines(current_text)
+        if _compact_line(line) not in compact_spoken
+    ]
+    if not remaining:
+        return None
+    return "".join(remaining).strip()
+
+
+def extract_incremental_text(
+    previous_text: str | None,
+    current_text: str,
+    *,
+    spoken_text: str | None = None,
+) -> str:
     current = collapse_visual_line_breaks(current_text)
     if not previous_text:
         return current
@@ -1836,6 +1918,14 @@ def extract_incremental_text(previous_text: str | None, current_text: str) -> st
         prefix_end = _fuzzy_prefix_end(previous, current)
     if prefix_end is not None:
         return current[prefix_end:].strip()
+    appended = _appended_lines(previous_text, current_text)
+    if appended is not None:
+        return appended
+    # Last resort: re-reading the screen is better than stalling the session,
+    # but never re-read what this page already narrated.
+    unspoken = _drop_spoken_lines(current_text, spoken_text)
+    if unspoken is not None:
+        return unspoken
     return current
 
 
@@ -4438,7 +4528,11 @@ def main(argv: list[str] | None = None) -> int:
                         waited_seconds=advance_marker.waited_seconds,
                         retry_count=advance_marker.retry_count,
                     )
-                    turn_text = extract_incremental_text(last_text, text)
+                    turn_text = extract_incremental_text(
+                        last_text,
+                        text,
+                        spoken_text="".join(page_text_parts),
+                    )
                     if not turn_text:
                         turn_text = collapse_visual_line_breaks(text)
                         print(
@@ -4795,7 +4889,11 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
                 print(f"\n[{turn_label}] OCR本文:\n{text}")
-                turn_text = extract_incremental_text(last_text, text)
+                turn_text = extract_incremental_text(
+                    last_text,
+                    text,
+                    spoken_text="".join(page_text_parts),
+                )
                 if not turn_text:
                     if (
                         live_timed_session

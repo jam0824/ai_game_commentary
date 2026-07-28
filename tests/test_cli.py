@@ -2077,6 +2077,96 @@ def test_extract_incremental_text_keeps_replaced_screen_text() -> None:
     )
 
 
+def test_extract_incremental_text_tolerates_reordered_ocr_lines() -> None:
+    """OCRが行順を入れ替えても、追加された行だけを返す"""
+    previous = (
+        "突然、小林さんががばっと立ち上がった。\n"
+        "「どうかしましたか?」\n"
+        "ぼくはたずねた。\n"
+        "外を調べて来る」\n"
+        "「外を?どうしてですか?」"
+    )
+    current = (
+        "突然、小林さんががばっと立ち上がった。\n"
+        "「どうかしましたか?」\n"
+        "外を調べて来る」\n"
+        "「外を?どうしてですか?」\n"
+        "「何か、痕跡があるかもしれないじゃないか。\n"
+        "ぼくはたずねた。"
+    )
+
+    assert extract_incremental_text(previous, current) == (
+        "「何か、痕跡があるかもしれないじゃないか。"
+    )
+
+
+def test_extract_incremental_text_tolerates_reordered_and_rewritten_lines() -> None:
+    """行順の入れ替えとOCR揺れが同時に起きても、追加された行だけを返す"""
+    previous = (
+        "突然、小林さんががばっと立ち上がった。\n"
+        "「どうかしましたか?」\n"
+        "外を調べて来る」\n"
+        "「外を?どうしてですか?」\n"
+        "「何か、痕跡があるかもしれないじゃないか。\n"
+        "ぼくはたずねた。"
+    )
+    current = (
+        "突然、 小林さんががばっと立ち上がった。\n"
+        "「どうかしましたか?」\n"
+        "ぼくはたずねた。\n"
+        "外を調べて来る」\n"
+        "「外を?どうしてですか?」\n"
+        "「…… 痕跡があるかもしれないじゃないか。\n"
+        "足跡とかタイヤの跡とか」"
+    )
+
+    assert extract_incremental_text(previous, current) == (
+        "足跡とかタイヤの跡とか」"
+    )
+
+
+def test_extract_incremental_text_keeps_replaced_page_with_reordered_lines() -> None:
+    """行が総入れ替えになったページ切り替えでは、従来どおり全文を返す"""
+    previous = (
+        "真理とは、今年の四月に大学で知り合った。\n"
+        "果敢かつ執ようなアタックを繰り返してきた。"
+    )
+    current = (
+        "季節はいつのまにか冬になっていた。\n"
+        "山荘には誰も近づかなくなっていた。"
+    )
+
+    assert extract_incremental_text(previous, current) == (
+        "季節はいつのまにか冬になっていた。山荘には誰も近づかなくなっていた。"
+    )
+
+
+def test_extract_incremental_text_drops_lines_already_spoken_on_page() -> None:
+    """差分が特定できない画面でも、このページで朗読済みの行は読み直さない"""
+    previous = "まったく無関係な直前の画面テキスト。"
+    current = (
+        "突然、小林さんががばっと立ち上がった。\n"
+        "「どうかしましたか?」\n"
+        "「外を調べて来る」"
+    )
+    spoken = "突然、小林さんががばっと立ち上がった。「どうかしましたか?」"
+
+    assert extract_incremental_text(previous, current, spoken_text=spoken) == (
+        "「外を調べて来る」"
+    )
+
+
+def test_extract_incremental_text_keeps_full_text_when_all_lines_spoken() -> None:
+    """朗読済み行を除くと何も残らない場合は、全文を返して進行を止めない"""
+    previous = "まったく無関係な直前の画面テキスト。"
+    current = "突然、小林さんががばっと立ち上がった。\n「どうかしましたか?」"
+    spoken = "突然、小林さんががばっと立ち上がった。「どうかしましたか?」"
+
+    assert extract_incremental_text(previous, current, spoken_text=spoken) == (
+        "突然、小林さんががばっと立ち上がった。「どうかしましたか?」"
+    )
+
+
 def test_parse_commentary_plan() -> None:
     plan = parse_commentary_plan(
         '{"comment":"これは怪しい……","emotion":"tense",'
