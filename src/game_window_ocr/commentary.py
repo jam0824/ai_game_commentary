@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
 import re
@@ -34,6 +33,7 @@ from .cli import (
     parse_crop,
     prepare_ocr_image,
 )
+from . import memory_store
 from .persistent_ocr import PersistentNdlOcr
 from .obs_window import OBS_WINDOW_TITLE, ObsCaptureWindow
 from .subtitles import SrtSubtitleWriter
@@ -3184,37 +3184,15 @@ def _session_stop_reason(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary_path.replace(path)
+    memory_store.write_json_atomic(path, payload)
 
 
 def _read_json_object(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
-        raise ValueError(
-            f"既存の全体記憶を読み込めません: {path} ({exc})"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise ValueError(
-            f"既存の全体記憶がJSONオブジェクトではありません: {path}"
-        )
-    return payload
+    return memory_store.read_json_object(path)
 
 
 def _safe_title_memory_dir(memory_dir: Path, title: str) -> Path:
-    normalized = unicodedata.normalize("NFKC", title).strip()
-    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", normalized)
-    safe = re.sub(r"\s+", "_", safe).strip(" ._")[:80] or "game"
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
-    return memory_dir / f"{safe}_{digest}"
+    return memory_store.safe_title_memory_dir(memory_dir, title)
 
 
 def _load_prior_commentary_memory(
@@ -3869,10 +3847,21 @@ def _create_session_memories(
         overall_memory["previous_memory_backup"] = str(backup_path)
     else:
         overall_memory["previous_memory_backup"] = None
+    try:
+        rollback_path = memory_store.backup_overall_memory(overall_path)
+    except OSError as exc:
+        rollback_path = None
+        print(
+            "警告: ロールバック用に1回前の全体記憶を退避できませんでした。"
+            f"今回の更新は取り消せません: {exc}",
+            file=sys.stderr,
+        )
     _write_json_atomic(overall_path, overall_memory)
     if backup_path is not None:
         print(f"初期化前の実況記憶バックアップ: {backup_path.resolve()}")
     print(f"全体の実況記憶: {overall_path.resolve()}")
+    if rollback_path is not None:
+        print(f"ロールバック用の1回前の記憶: {rollback_path.resolve()}")
 
 
 def _finalize_timed_session(

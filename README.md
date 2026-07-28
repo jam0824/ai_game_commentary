@@ -203,6 +203,29 @@ uv run game-commentary --press-enter --initialize-memory
 実況終了を無期限に待たせません。モデルと保存先は `summary_model`、
 `memory_dir`、または対応するコマンドライン引数で変更できます。
 
+## 全体記憶のロールバック
+
+撮影に失敗した回の記憶を取り消せるよう、`overall.json` を上書きする直前の
+内容を同じフォルダの `overall.previous.json` へ1世代だけ残します。
+戻すときは実況とは別のスクリプトを実行します。
+
+```powershell
+uv run game-memory-rollback --dry-run
+uv run game-memory-rollback
+```
+
+`game-commentary.toml` の `title` と `memory_dir` から対象を決めるため、
+通常は引数なしで実行できます。別のタイトルや保存先を指定する場合は
+`--title`、`--memory-dir` を使います。実行前に現在の記憶と戻す先の記憶
+（セッション数、更新日時、直近の実況要約）を表示して確認を求めるので、
+確認なしで実行したい場合は `--yes` を付けます。
+
+処理は `overall.json` と `overall.previous.json` の入れ替えです。誤って
+実行した場合はもう一度実行すれば元の状態へ戻ります。保持しているのは
+1世代だけなので、2回以上前の記憶へは戻せません。`overall.previous.json`
+がまだ無い場合（このフォルダで一度も記憶を更新していない場合）は、
+何も書き換えずに終了コード1で知らせます。
+
 音声を再生せずファイルだけ生成するには `--no-playback`、感想なしの朗読試験には
 `--narration-only` を指定します。
 
