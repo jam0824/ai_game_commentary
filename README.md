@@ -183,8 +183,9 @@ OCRが空白位置だけを変えた場合や、既読部分に少量の文字�
 `--no-obs-window` でウィンドウを表示しない場合は、準備完了時に自動開始します。
 
 時間終了時には、今回の展開を踏まえた終了挨拶、簡単な感想、チャンネル登録と
-高評価の案内を発話し、同じ字幕へ追加します。その後、既定では
-`gpt-5.6-luna` を使って実行フォルダ直下の `session_memory.json` と、
+高評価の案内を、既定では `gpt-5.6-luna` で作って発話し、同じ字幕へ追加します。
+その後、既定では `gpt-5.6-sol` を使って実行フォルダ直下の
+`session_memory.json` と、
 `output\memory\タイトル_ハッシュ\overall.json` を作成・更新します。
 通常起動では、そのタイトルの `overall.json` を最初の実況プランへ読み込み、
 前回までの物語や未解決事項を踏まえて実況します。過去の記憶を使わず新しく
@@ -200,8 +201,10 @@ uv run game-commentary --press-enter --initialize-memory
 `overall.json` を新規状態（セッション数1）で置き換えます。
 要約に2回失敗した場合は元のターン記録を
 `session_memory_pending.json` または `overall_memory_pending.json` に残し、
-実況終了を無期限に待たせません。モデルと保存先は `summary_model`、
-`memory_dir`、または対応するコマンドライン引数で変更できます。
+実況終了を無期限に待たせません。モデルと保存先は締めが `summary_model`、
+記憶生成が `memory_model`、保存先が `memory_dir`、または対応する
+コマンドライン引数（`--summary-model`、`--memory-model`、`--memory-dir`）で
+変更できます。
 
 ## 全体記憶のロールバック
 

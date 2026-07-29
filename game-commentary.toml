@@ -4,7 +4,10 @@
 title = "かまいたちの夜"
 model = "gpt-realtime-2.1-mini"
 commentary_model = "gpt-5.6-luna"
+# 締めの挨拶に使うモデル。
 summary_model = "gpt-5.6-luna"
+# 実況終了時の記憶（session_memory.json・overall.json）生成に使うモデル。
+memory_model = "gpt-5.6-sol"
 voice = "marin"
 # 実況者の設定。相対パスはこの設定ファイルの場所を基準にします。
 persona_file = "commentator-persona.md"

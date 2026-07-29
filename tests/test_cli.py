@@ -1,4 +1,6 @@
+import argparse
 import json
+import time
 from threading import Event
 
 import pytest
@@ -147,6 +149,43 @@ def test_commentary_defaults_to_timed_unlimited_live_session() -> None:
     assert args.unchanged_screen_retries == 3
     assert args.summary_model == "gpt-5.6-luna"
     assert args.initialize_memory is False
+
+
+def test_memory_model_defaults_apart_from_summary_model() -> None:
+    """記憶生成のモデルは締めとは別に指定できる"""
+    defaults = commentary_module._build_parser().parse_args([])
+    overridden = commentary_module._build_parser().parse_args(
+        ["--memory-model", "gpt-5.6-terra"]
+    )
+
+    assert defaults.summary_model == "gpt-5.6-luna"
+    assert defaults.memory_model == "gpt-5.6-sol"
+    assert overridden.summary_model == "gpt-5.6-luna"
+    assert overridden.memory_model == "gpt-5.6-terra"
+
+
+def test_memory_model_is_loaded_from_config(tmp_path) -> None:
+    """設定ファイルのmemory_modelを読み込む"""
+    config_path = tmp_path / "commentary.toml"
+    config_path.write_text(
+        'summary_model = "gpt-5.6-luna"\nmemory_model = "gpt-5.6-sol"\n',
+        encoding="utf-8",
+    )
+
+    configured = commentary_module._parse_args(["--config", str(config_path)])
+
+    assert configured.summary_model == "gpt-5.6-luna"
+    assert configured.memory_model == "gpt-5.6-sol"
+
+
+def test_empty_memory_model_is_rejected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--memory-model が空なら起動せずエラーにする"""
+    result = commentary_module.main(["--memory-model", "  "])
+
+    assert result == 2
+    assert "--memory-model" in capsys.readouterr().err
 
 
 def test_commentary_memory_can_be_initialized_from_cli() -> None:
@@ -1828,9 +1867,11 @@ def test_main_stops_automatic_input_after_unchanged_retry_limit(
                 response_id=f"{phase}-response",
             )
 
+    planner_models: list[str] = []
+
     class FakeSummaryPlanner:
         def __init__(self, **kwargs) -> None:
-            pass
+            planner_models.append(kwargs["model"])
 
         def __enter__(self):
             return self
@@ -1901,11 +1942,16 @@ def test_main_stops_automatic_input_after_unchanged_retry_limit(
             str(tmp_path),
             "--memory-dir",
             str(tmp_path / "memory"),
+            "--summary-model",
+            "gpt-5.6-luna",
+            "--memory-model",
+            "gpt-5.6-sol",
         ]
     )
 
     assert result == 0
     assert events == ["startup", "narration", "enter", "finalize"]
+    assert planner_models == ["gpt-5.6-luna", "gpt-5.6-sol"]
     stopped_summary = json.loads(
         (tmp_path / "turn_002" / "result.json").read_text(encoding="utf-8")
     )
@@ -3216,7 +3262,7 @@ def test_session_and_overall_memories_are_created_and_updated(tmp_path) -> None:
             root=root,
             memory_dir=memory_dir,
             title="かまいたちの夜",
-            summary_model="gpt-5.6-luna",
+            memory_model="gpt-5.6-sol",
             termination_reason="duration_breakpoint",
             elapsed_seconds=1_205.0,
             records=records,
@@ -3243,6 +3289,121 @@ def test_session_and_overall_memories_are_created_and_updated(tmp_path) -> None:
     assert session_memory["turn_count"] == 1
     assert overall_memory["session_count"] == 2
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_session_memories_record_the_memory_model(tmp_path) -> None:
+    """記憶ファイルには記憶生成に使ったモデル名を残す"""
+    root = tmp_path / "session"
+    root.mkdir()
+    memory_dir = tmp_path / "memory"
+
+    class FakePlanner:
+        def generate_text(self, **kwargs) -> TextResult:
+            if kwargs["phase"] == "session_memory":
+                payload = {
+                    "summary": "雪山の宿へ着いた。",
+                    "key_events": [],
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": [],
+                    "commentator_impression": "続きが気になる。",
+                    "next_start_point": "宿へ入る場面から再開する。",
+                }
+            else:
+                payload = {
+                    "story_summary": "透は雪山の宿へ向かった。",
+                    "characters": [],
+                    "important_choices": [],
+                    "unresolved_threads": [],
+                    "current_state": "宿へ入る直前。",
+                    "commentator_perspective": "静かな導入を疑っている。",
+                    "next_start_point": "宿へ入る場面から再開する。",
+                }
+            return TextResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                response_id=f'{kwargs["phase"]}-response',
+            )
+
+    commentary_module._create_session_memories(
+        planner=FakePlanner(),
+        root=root,
+        memory_dir=memory_dir,
+        title="かまいたちの夜",
+        memory_model="gpt-5.6-sol",
+        termination_reason="duration_breakpoint",
+        elapsed_seconds=1_205.0,
+        records=[{"turn": "turn_001", "game_text": "雪山の宿が見えた。"}],
+    )
+
+    session_memory = json.loads(
+        (root / "session_memory.json").read_text(encoding="utf-8")
+    )
+    overall_memory = json.loads(
+        (
+            commentary_module._safe_title_memory_dir(
+                memory_dir,
+                "かまいたちの夜",
+            )
+            / "overall.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert session_memory["memory_model"] == "gpt-5.6-sol"
+    assert overall_memory["memory_model"] == "gpt-5.6-sol"
+
+
+def test_finalize_uses_memory_planner_only_for_memory_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """締めはsummary_planner、記憶生成はmemory_plannerを使う"""
+    root = tmp_path / "session"
+    root.mkdir()
+    summary_planner = object()
+    memory_planner = object()
+    used: dict[str, object] = {}
+
+    def fake_closing(**kwargs) -> None:
+        used["closing_planner"] = kwargs["planner"]
+
+    def fake_memories(**kwargs) -> None:
+        used["memory_planner"] = kwargs["planner"]
+        used["memory_model"] = kwargs["memory_model"]
+
+    monkeypatch.setattr(
+        commentary_module,
+        "_create_closing_message",
+        fake_closing,
+    )
+    monkeypatch.setattr(
+        commentary_module,
+        "_create_session_memories",
+        fake_memories,
+    )
+
+    commentary_module._finalize_timed_session(
+        summary_planner=summary_planner,
+        memory_planner=memory_planner,
+        realtime=None,
+        subtitle_writer=None,
+        root=root,
+        args=argparse.Namespace(
+            no_playback=True,
+            ocr_replacements={},
+            memory_dir=tmp_path / "memory",
+            title="かまいたちの夜",
+            summary_model="gpt-5.6-luna",
+            memory_model="gpt-5.6-sol",
+            initialize_memory=False,
+        ),
+        persona="実況者の人格",
+        termination_reason="duration_breakpoint",
+        session_started_at=time.monotonic(),
+    )
+
+    assert used["closing_planner"] is summary_planner
+    assert used["memory_planner"] is memory_planner
+    assert used["memory_model"] == "gpt-5.6-sol"
 
 
 def test_initialize_memory_starts_fresh_and_backs_up_existing_overall(
@@ -3301,7 +3462,7 @@ def test_initialize_memory_starts_fresh_and_backs_up_existing_overall(
         root=root,
         memory_dir=memory_dir,
         title=title,
-        summary_model="gpt-5.6-luna",
+        memory_model="gpt-5.6-sol",
         termination_reason="duration_breakpoint",
         elapsed_seconds=1_205.0,
         records=[{"turn": "turn_001", "game_text": "新しい本文"}],
@@ -3377,7 +3538,7 @@ def test_initialize_memory_preserves_existing_overall_if_backup_fails(
         root=root,
         memory_dir=memory_dir,
         title=title,
-        summary_model="gpt-5.6-luna",
+        memory_model="gpt-5.6-sol",
         termination_reason="duration_breakpoint",
         elapsed_seconds=1_205.0,
         records=[{"turn": "turn_001", "game_text": "新しい本文"}],
@@ -3405,7 +3566,7 @@ def test_memory_failure_saves_pending_source_without_raising(tmp_path) -> None:
         root=root,
         memory_dir=tmp_path / "memory",
         title="かまいたちの夜",
-        summary_model="gpt-5.6-luna",
+        memory_model="gpt-5.6-sol",
         termination_reason="duration_breakpoint",
         elapsed_seconds=1_205.0,
         records=[{"turn": "turn_001", "game_text": "雪が降っていた。"}],
@@ -3462,7 +3623,7 @@ def test_invalid_existing_overall_memory_is_preserved(
         root=root,
         memory_dir=memory_dir,
         title="かまいたちの夜",
-        summary_model="gpt-5.6-luna",
+        memory_model="gpt-5.6-sol",
         termination_reason="duration_breakpoint",
         elapsed_seconds=1_205.0,
         records=[{"turn": "turn_001", "game_text": "本文"}],

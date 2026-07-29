@@ -51,6 +51,7 @@ from .windows import (
 DEFAULT_MODEL = "gpt-realtime-2.1-mini"
 DEFAULT_COMMENTARY_MODEL = "gpt-5.6-luna"
 DEFAULT_SUMMARY_MODEL = "gpt-5.6-luna"
+DEFAULT_MEMORY_MODEL = "gpt-5.6-sol"
 DEFAULT_VOICE = "marin"
 SAMPLE_RATE = 24_000
 PCM_BYTES_PER_SECOND = SAMPLE_RATE * 2
@@ -88,6 +89,7 @@ DEFAULT_CONFIG_VALUES: dict[str, str | int | float] = {
     "model": DEFAULT_MODEL,
     "commentary_model": DEFAULT_COMMENTARY_MODEL,
     "summary_model": DEFAULT_SUMMARY_MODEL,
+    "memory_model": DEFAULT_MEMORY_MODEL,
     "voice": DEFAULT_VOICE,
     "persona_file": str(DEFAULT_PERSONA_FILE),
     "initial_intro_file": str(DEFAULT_INITIAL_INTRO_FILE),
@@ -2836,8 +2838,16 @@ def _build_parser(
         "--summary-model",
         default=defaults["summary_model"],
         help=(
-            "締めと記憶の生成に使うResponses APIモデル。"
+            "締めの挨拶に使うResponses APIモデル。"
             f"既定値は {defaults['summary_model']}。"
+        ),
+    )
+    parser.add_argument(
+        "--memory-model",
+        default=defaults["memory_model"],
+        help=(
+            "実況終了時の記憶（session_memory・overall）生成に使う"
+            f"Responses APIモデル。既定値は {defaults['memory_model']}。"
         ),
     )
     parser.add_argument("--voice", default=defaults["voice"])
@@ -3864,7 +3874,7 @@ def _create_session_memories(
     root: Path,
     memory_dir: Path,
     title: str,
-    summary_model: str,
+    memory_model: str,
     termination_reason: str,
     elapsed_seconds: float,
     records: list[dict[str, Any]],
@@ -3892,7 +3902,7 @@ def _create_session_memories(
                 "schema_version": 1,
                 "game_title": title,
                 "created_at": created_at,
-                "summary_model": summary_model,
+                "memory_model": memory_model,
                 "termination_reason": termination_reason,
                 "elapsed_seconds": elapsed_seconds,
                 "generation_errors": session_errors,
@@ -3910,7 +3920,7 @@ def _create_session_memories(
         "schema_version": 1,
         "game_title": title,
         "created_at": created_at,
-        "summary_model": summary_model,
+        "memory_model": memory_model,
         "termination_reason": termination_reason,
         "elapsed_seconds": elapsed_seconds,
         "turn_count": len(records),
@@ -3993,7 +4003,7 @@ def _create_session_memories(
         "schema_version": 1,
         "game_title": title,
         "updated_at": created_at,
-        "summary_model": summary_model,
+        "memory_model": memory_model,
         "session_count": previous_count + 1,
         "initialized": initialize_memory,
         **overall_payload,
@@ -4060,6 +4070,7 @@ def _create_session_memories(
 def _finalize_timed_session(
     *,
     summary_planner: ResponsesCommentaryPlanner,
+    memory_planner: ResponsesCommentaryPlanner,
     realtime: RealtimeSpeechClient,
     subtitle_writer: SrtSubtitleWriter,
     root: Path,
@@ -4094,11 +4105,11 @@ def _finalize_timed_session(
         )
     try:
         _create_session_memories(
-            planner=summary_planner,
+            planner=memory_planner,
             root=root,
             memory_dir=args.memory_dir,
             title=args.title,
-            summary_model=args.summary_model,
+            memory_model=args.memory_model,
             termination_reason=termination_reason,
             elapsed_seconds=session_elapsed_seconds,
             records=records,
@@ -4177,6 +4188,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not str(args.summary_model).strip():
         print("エラー: --summary-model は空にできません。", file=sys.stderr)
+        return 2
+    if not str(args.memory_model).strip():
+        print("エラー: --memory-model は空にできません。", file=sys.stderr)
         return 2
     if args.after_enter_delay < 0:
         print("エラー: --after-enter-delay は0以上にしてください。", file=sys.stderr)
@@ -5313,13 +5327,23 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
             if termination_reason is not None:
-                print(f"Responses締め・記憶生成を使用: {args.summary_model}")
+                print(
+                    f"Responses締めを使用: {args.summary_model} / "
+                    f"記憶生成を使用: {args.memory_model}"
+                )
                 summary_stack = ExitStack()
                 try:
                     summary_planner = summary_stack.enter_context(
                         ResponsesCommentaryPlanner(
                             api_key=api_key,
                             model=args.summary_model,
+                            timeout=args.timeout,
+                        )
+                    )
+                    memory_planner = summary_stack.enter_context(
+                        ResponsesCommentaryPlanner(
+                            api_key=api_key,
+                            model=args.memory_model,
                             timeout=args.timeout,
                         )
                     )
@@ -5358,7 +5382,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "created_at": (
                                     datetime.now().astimezone().isoformat()
                                 ),
-                                "summary_model": args.summary_model,
+                                "memory_model": args.memory_model,
                                 "termination_reason": termination_reason,
                                 "generation_errors": [str(exc)],
                                 "session_records": _collect_session_records(
@@ -5376,6 +5400,7 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         _finalize_timed_session(
                             summary_planner=summary_planner,
+                            memory_planner=memory_planner,
                             realtime=realtime,
                             subtitle_writer=subtitle_writer,
                             root=root,
