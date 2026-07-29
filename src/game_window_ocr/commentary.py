@@ -61,6 +61,9 @@ FUZZY_PREFIX_MAX_ERROR_RATE = 0.12
 LINE_DIFF_MATCH_RATIO = 0.8
 LINE_DIFF_MIN_PREVIOUS_COVERAGE = 0.6
 COMMENTARY_PLAN_REVISIONS = 3
+COMMENTARY_FALLBACK_COMMENT = (
+    "うん、なるほどね。ここからどう転がっていくのか、ちょっと気になるかも。"
+)
 CHOICE_PLAN_REVISIONS = 3
 OCR_INTERVAL = 0.5
 CHOICE_SPEECH_SIMILARITY_THRESHOLD = 0.88
@@ -1556,67 +1559,89 @@ def parse_commentary_plan(raw_text: str) -> CommentaryPlan:
     )
 
 
+def _commentary_comment_limit(mode: str, advance_marker: str) -> int:
+    if advance_marker == "book":
+        return 90
+    return {"reaction": 20, "quick": 35, "extended": 90}.get(mode, 90)
+
+
 def commentary_plan_issue(
     plan: CommentaryPlan,
     *,
     must_speak: bool = False,
     advance_marker: str = "unknown",
 ) -> str | None:
+    """Report only what makes a plan unusable, never a wording preference.
+
+    Every issue returned here costs an extra planner round trip mid-stream, so
+    style deviations belong in commentary_plan_style_notes instead.
+    """
     if must_speak and plan.mode == "silent":
         return "ページ終端で未発話のためsilentは禁止です"
-    if advance_marker == "triangle" and plan.mode == "quick":
-        return "通常の文字送りではquickを使いません"
     if plan.mode == "silent":
-        if plan.comment:
-            return "silentなのにcommentが空ではありません"
         return None
     if not plan.comment or plan.comment == "……。":
         return f"{plan.mode}なのに有効なcommentがありません"
+    limit = _commentary_comment_limit(plan.mode, advance_marker)
+    if len(plan.comment) > limit:
+        if advance_marker == "book":
+            return (
+                f"ページ終端の感想が{limit}文字を超えています"
+                f"（{len(plan.comment)}文字）"
+            )
+        return (
+            f"{plan.mode}の上限{limit}文字を超えています"
+            f"（{len(plan.comment)}文字）"
+        )
+    return None
+
+
+def commentary_plan_style_notes(
+    plan: CommentaryPlan,
+    *,
+    advance_marker: str = "unknown",
+) -> list[str]:
+    """Collect wording that drifted from the persona without blocking it.
+
+    These are recorded per turn so the persona prompt can be tuned from real
+    output later, rather than stalling a live session to re-roll a comment.
+    """
+    if plan.mode == "silent" or not plan.comment:
+        return []
+    notes: list[str] = []
     sentence_ends = len(re.findall(r"[。！？!?]+", plan.comment))
     if advance_marker == "book":
         if plan.mode == "reaction":
-            return "ページ終端ではreactionだけでなく2～3文の感想を話してください"
+            notes.append(
+                "ページ終端ではreactionだけでなく2～3文の感想が欲しい場面です"
+            )
         if len(plan.comment) < 28:
-            return (
+            notes.append(
                 "ページ終端の感想が28文字未満で短すぎます"
                 f"（{len(plan.comment)}文字）"
             )
-        if len(plan.comment) > 90:
-            return (
-                "ページ終端の感想が90文字を超えています"
-                f"（{len(plan.comment)}文字）"
-            )
         if sentence_ends < 2:
-            return "ページ終端の感想が1文だけです。2～3文にしてください"
-        if sentence_ends > 3:
-            return "ページ終端の感想が4文以上あります。2～3文にしてください"
+            notes.append("ページ終端の感想が1文だけです（2～3文が狙い）")
+        elif sentence_ends > 3:
+            notes.append("ページ終端の感想が4文以上あります（2～3文が狙い）")
         soft_ending = re.search(
             r"(?:よね|だね|かも|じゃない|かな|気がする|っぽい|でしょ|じゃん)"
             r"(?=[。！？!?…〜～ー]|$)",
             plan.comment,
         )
         if not soft_ending:
-            return "ページ終端の感想に、友達へ話しかける柔らかい語尾がありません"
-    else:
-        if plan.mode == "reaction":
-            limit = 20
-        elif plan.mode == "quick":
-            limit = 35
-        else:
-            limit = 90
-        if len(plan.comment) > limit:
-            return (
-                f"{plan.mode}の上限{limit}文字を超えています"
-                f"（{len(plan.comment)}文字）"
+            notes.append(
+                "ページ終端の感想に、友達へ話しかける柔らかい語尾がありません"
             )
+    else:
+        if advance_marker == "triangle" and plan.mode == "quick":
+            notes.append("通常の文字送りでquickを使っています")
         if plan.mode == "quick" and len(plan.comment) < 8:
-            return f"quickなのに8文字未満です（{len(plan.comment)}文字）"
-    if advance_marker != "book" and plan.mode in {"reaction", "quick"}:
-        if sentence_ends > 1:
-            return f"{plan.mode}なのに2文以上あります"
-    if advance_marker != "book" and plan.mode == "extended":
-        if sentence_ends > 2:
-            return "extendedなのに3文以上あります"
+            notes.append(f"quickなのに8文字未満です（{len(plan.comment)}文字）")
+        if plan.mode in {"reaction", "quick"} and sentence_ends > 1:
+            notes.append(f"{plan.mode}なのに2文以上あります")
+        if plan.mode == "extended" and sentence_ends > 2:
+            notes.append("extendedなのに3文以上あります")
     banned = (
         "本文では",
         "ゲーム内では",
@@ -1629,22 +1654,80 @@ def commentary_plan_issue(
         "気になる気配",
         "胸が熱くなる",
     )
-    found = next((phrase for phrase in banned if phrase in plan.comment), None)
-    if found:
-        return f"解説口調の禁止表現「{found}」を含んでいます"
+    notes.extend(
+        f"解説口調の禁止表現「{phrase}」を含んでいます"
+        for phrase in banned
+        if phrase in plan.comment
+    )
     nominal_ending = re.search(
         r"(予感|気配|印象|真相|正体|影|裏|謎)[。…!！?？]*$",
         plan.comment,
     )
     if nominal_ending:
-        return f"体言止め「{nominal_ending.group(1)}」で終わっています"
+        notes.append(f"体言止め「{nominal_ending.group(1)}」で終わっています")
     blunt_ending = re.search(
         r"(だな(?:あ|ぁ)?|だろ(?:う)?)(?=[。！？!?…〜～ー]|$)",
         plan.comment,
     )
     if blunt_ending:
-        return f"ぶっきらぼうな語尾「{blunt_ending.group(1)}」を含んでいます"
-    return None
+        notes.append(
+            f"ぶっきらぼうな語尾「{blunt_ending.group(1)}」を含んでいます"
+        )
+    return notes
+
+
+def _truncate_comment_to_limit(comment: str, limit: int) -> str:
+    """Cut at a sentence boundary so a trimmed comment still sounds finished."""
+    if len(comment) <= limit:
+        return comment
+    kept = ""
+    for sentence in re.findall(r"[^。！？!?]*[。！？!?]+|[^。！？!?]+$", comment):
+        if len(kept) + len(sentence) > limit:
+            break
+        kept += sentence
+    kept = kept.strip()
+    if kept:
+        return kept
+    return comment[: max(1, limit - 1)].strip() + "。"
+
+
+def commentary_plan_fallback(
+    plan: CommentaryPlan,
+    *,
+    must_speak: bool = False,
+    advance_marker: str = "unknown",
+) -> CommentaryPlan:
+    """Make a plan speakable after every revision attempt failed.
+
+    Stopping the session is worse than a slightly blunt comment, so the last
+    plan is repaired locally instead of raising.
+    """
+    mode = plan.mode
+    comment = plan.comment
+    emotion = plan.emotion
+    intensity = plan.intensity
+    pace = plan.pace
+    if mode == "silent":
+        if not must_speak:
+            return plan
+        mode = "quick"
+        comment = ""
+        emotion = "thoughtful"
+        intensity = 0.5
+        pace = "normal"
+    if not comment or comment == "……。":
+        comment = COMMENTARY_FALLBACK_COMMENT
+    comment = _truncate_comment_to_limit(
+        comment,
+        _commentary_comment_limit(mode, advance_marker),
+    )
+    return CommentaryPlan(
+        comment=comment,
+        mode=mode,
+        emotion=emotion,
+        intensity=intensity,
+        pace=pace,
+    )
 
 
 def apply_commentary_intensity_boost(
@@ -5070,11 +5153,24 @@ def main(argv: list[str] | None = None) -> int:
                             must_speak=must_speak,
                             advance_marker=advance_marker.kind,
                         )
+                    plan_fallback_applied = plan_issue is not None
                     if plan_issue is not None:
-                        raise RuntimeError(
-                            "感想案が実況タイミングの条件を満たせませんでした: "
-                            f"{plan_issue}。Enterは送りません。"
+                        commentary_plan = commentary_plan_fallback(
+                            commentary_plan,
+                            must_speak=must_speak,
+                            advance_marker=advance_marker.kind,
                         )
+                        print(
+                            "警告: 感想案が条件を満たせなかったため、"
+                            f"手元で整えて続けます: {plan_issue}",
+                            file=sys.stderr,
+                        )
+                    plan_style_notes = commentary_plan_style_notes(
+                        commentary_plan,
+                        advance_marker=advance_marker.kind,
+                    )
+                    for note in plan_style_notes:
+                        print(f"文体メモ: {note}")
                     commentary_plan, commentary_intensity_boosted = (
                         apply_commentary_intensity_boost(commentary_plan)
                     )
@@ -5089,6 +5185,9 @@ def main(argv: list[str] | None = None) -> int:
                     plan_record = {
                         **asdict(commentary_plan),
                         "intensity_boosted": commentary_intensity_boosted,
+                        "style_notes": plan_style_notes,
+                        "fallback_applied": plan_fallback_applied,
+                        "unresolved_issue": plan_issue,
                         "advance_marker": advance_marker.kind,
                         "page_has_spoken_before": page_has_spoken_before,
                         "must_speak": must_speak,

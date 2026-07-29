@@ -22,7 +22,9 @@ from game_window_ocr.commentary import (
     choice_plan_issue,
     choice_utterance,
     collapse_visual_line_breaks,
+    commentary_plan_fallback,
     commentary_plan_issue,
+    commentary_plan_style_notes,
     detect_advance_marker,
     extract_choice_options,
     extract_incremental_text,
@@ -2256,7 +2258,8 @@ def test_commentary_policy_requires_speech_at_unspoken_page_end() -> None:
     )
 
 
-def test_commentary_policy_disallows_quick_at_triangle_marker() -> None:
+def test_commentary_policy_notes_quick_at_triangle_marker() -> None:
+    """通常の文字送りでのquickは作り直さず、文体メモにだけ残す"""
     quick = CommentaryPlan(
         comment="へぇ、そうなんだ。",
         mode="quick",
@@ -2264,13 +2267,9 @@ def test_commentary_policy_disallows_quick_at_triangle_marker() -> None:
         intensity=0.3,
         pace="normal",
     )
-    assert "quickを使いません" in (
-        commentary_plan_issue(
-            quick,
-            advance_marker="triangle",
-        )
-        or ""
-    )
+    assert commentary_plan_issue(quick, advance_marker="triangle") is None
+    notes = commentary_plan_style_notes(quick, advance_marker="triangle")
+    assert any("quick" in note for note in notes)
 
 
 def test_commentary_policy_keeps_reaction_at_triangle_marker() -> None:
@@ -2305,7 +2304,8 @@ def test_commentary_policy_accepts_two_sentence_page_comment() -> None:
     ) is None
 
 
-def test_commentary_policy_rejects_short_page_comment() -> None:
+def test_commentary_policy_notes_short_page_comment() -> None:
+    """ページ終端の感想が短くても作り直さず、文体メモにだけ残す"""
     short_comment = CommentaryPlan(
         comment="頼りになりそうだよね。",
         mode="quick",
@@ -2313,17 +2313,17 @@ def test_commentary_policy_rejects_short_page_comment() -> None:
         intensity=0.6,
         pace="normal",
     )
-    assert "短すぎます" in (
-        commentary_plan_issue(
-            short_comment,
-            must_speak=True,
-            advance_marker="book",
-        )
-        or ""
-    )
+    assert commentary_plan_issue(
+        short_comment,
+        must_speak=True,
+        advance_marker="book",
+    ) is None
+    notes = commentary_plan_style_notes(short_comment, advance_marker="book")
+    assert any("短すぎます" in note for note in notes)
 
 
-def test_commentary_policy_rejects_reaction_only_at_page_end() -> None:
+def test_commentary_policy_notes_reaction_only_at_page_end() -> None:
+    """ページ終端のreactionは作り直さず、文体メモにだけ残す"""
     reaction = CommentaryPlan(
         comment="うわっ！",
         mode="reaction",
@@ -2331,17 +2331,17 @@ def test_commentary_policy_rejects_reaction_only_at_page_end() -> None:
         intensity=0.9,
         pace="fast",
     )
-    assert "2～3文" in (
-        commentary_plan_issue(
-            reaction,
-            must_speak=True,
-            advance_marker="book",
-        )
-        or ""
-    )
+    assert commentary_plan_issue(
+        reaction,
+        must_speak=True,
+        advance_marker="book",
+    ) is None
+    notes = commentary_plan_style_notes(reaction, advance_marker="book")
+    assert any("2～3文" in note for note in notes)
 
 
-def test_commentary_policy_requires_soft_ending_at_page_end() -> None:
+def test_commentary_policy_notes_missing_soft_ending_at_page_end() -> None:
+    """柔らかい語尾がなくても作り直さず、文体メモにだけ残す"""
     flat = CommentaryPlan(
         comment=(
             "この子は落ち着いていて仕事もできそうに見える。"
@@ -2352,17 +2352,17 @@ def test_commentary_policy_requires_soft_ending_at_page_end() -> None:
         intensity=0.6,
         pace="normal",
     )
-    assert "柔らかい語尾" in (
-        commentary_plan_issue(
-            flat,
-            must_speak=True,
-            advance_marker="book",
-        )
-        or ""
-    )
+    assert commentary_plan_issue(
+        flat,
+        must_speak=True,
+        advance_marker="book",
+    ) is None
+    notes = commentary_plan_style_notes(flat, advance_marker="book")
+    assert any("柔らかい語尾" in note for note in notes)
 
 
-def test_commentary_policy_rejects_blunt_sentence_ending() -> None:
+def test_commentary_policy_notes_blunt_sentence_ending() -> None:
+    """ぶっきらぼうな語尾は作り直さず、文体メモにだけ残す"""
     blunt = CommentaryPlan(
         comment="この子、落ち着いてて頼りになりそうだな。",
         mode="quick",
@@ -2370,7 +2370,69 @@ def test_commentary_policy_rejects_blunt_sentence_ending() -> None:
         intensity=0.6,
         pace="normal",
     )
-    assert "ぶっきらぼうな語尾" in (commentary_plan_issue(blunt) or "")
+    assert commentary_plan_issue(blunt) is None
+    assert any(
+        "ぶっきらぼうな語尾" in note
+        for note in commentary_plan_style_notes(blunt)
+    )
+
+
+def test_commentary_policy_notes_two_sentence_reaction() -> None:
+    """reactionが2文でも作り直さず、文体メモにだけ残す"""
+    reaction = CommentaryPlan(
+        comment="えっ、待って。今の何？",
+        mode="reaction",
+        emotion="surprised",
+        intensity=0.9,
+        pace="fast",
+    )
+    assert commentary_plan_issue(reaction, advance_marker="triangle") is None
+    notes = commentary_plan_style_notes(reaction, advance_marker="triangle")
+    assert any("2文以上" in note for note in notes)
+
+
+def test_commentary_policy_notes_narrator_phrase() -> None:
+    """解説口調の禁止表現は作り直さず、文体メモにだけ残す"""
+    narrator = CommentaryPlan(
+        comment="本文では静かな夜が続いているみたいだね。",
+        mode="quick",
+        emotion="calm",
+        intensity=0.4,
+        pace="normal",
+    )
+    assert commentary_plan_issue(narrator) is None
+    assert any(
+        "本文では" in note
+        for note in commentary_plan_style_notes(narrator)
+    )
+
+
+def test_commentary_plan_style_notes_collects_every_deviation() -> None:
+    """文体メモは最初の1件で打ち切らず、外れた点をすべて集める"""
+    plan = CommentaryPlan(
+        comment="この子は頼りになりそうだな。",
+        mode="quick",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    notes = commentary_plan_style_notes(plan, advance_marker="book")
+    assert len(notes) >= 2
+
+
+def test_commentary_plan_style_notes_stay_empty_for_clean_plan() -> None:
+    """狙い通りの感想には文体メモが付かない"""
+    plan = CommentaryPlan(
+        comment=(
+            "この子、落ち着いてて頼りになりそうだよね。"
+            "眼鏡も似合ってるし、まとめ役っぽいかも。"
+        ),
+        mode="quick",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    assert commentary_plan_style_notes(plan, advance_marker="book") == []
 
 
 @pytest.mark.parametrize(
@@ -2422,7 +2484,8 @@ def test_commentary_plan_issue_accepts_natural_quick_comment() -> None:
     assert commentary_plan_issue(plan) is None
 
 
-def test_commentary_plan_issue_rejects_nominal_slogan_ending() -> None:
+def test_commentary_plan_issue_notes_nominal_slogan_ending() -> None:
+    """体言止めは作り直さず、文体メモにだけ残す"""
     plan = CommentaryPlan(
         comment="ゴーグルの向こう、可愛い予感。",
         mode="quick",
@@ -2430,7 +2493,87 @@ def test_commentary_plan_issue_rejects_nominal_slogan_ending() -> None:
         intensity=0.3,
         pace="normal",
     )
-    assert "体言止め" in (commentary_plan_issue(plan) or "")
+    assert commentary_plan_issue(plan) is None
+    assert any(
+        "体言止め" in note for note in commentary_plan_style_notes(plan)
+    )
+
+
+def test_commentary_plan_issue_rejects_long_page_comment() -> None:
+    """ページ終端の感想が90文字を超えたら作り直す"""
+    plan = CommentaryPlan(
+        comment="この子は落ち着いていて頼りになりそうだよね。" * 5,
+        mode="extended",
+        emotion="thoughtful",
+        intensity=0.6,
+        pace="normal",
+    )
+    assert "90文字" in (
+        commentary_plan_issue(plan, must_speak=True, advance_marker="book")
+        or ""
+    )
+
+
+def test_commentary_plan_issue_rejects_empty_comment() -> None:
+    """喋る内容がなければ作り直す"""
+    plan = CommentaryPlan(
+        comment="……。",
+        mode="quick",
+        emotion="calm",
+        intensity=0.4,
+        pace="normal",
+    )
+    assert "有効なcomment" in (commentary_plan_issue(plan) or "")
+
+
+def test_commentary_plan_fallback_speaks_at_unspoken_page_end() -> None:
+    """作り直しても直らなかったsilentは、停止せず喋れる案に差し替える"""
+    silent = CommentaryPlan(
+        comment="",
+        mode="silent",
+        emotion="calm",
+        intensity=0.0,
+        pace="normal",
+    )
+    fallback = commentary_plan_fallback(
+        silent,
+        must_speak=True,
+        advance_marker="book",
+    )
+    assert fallback.mode != "silent"
+    assert fallback.comment
+    assert commentary_plan_issue(
+        fallback,
+        must_speak=True,
+        advance_marker="book",
+    ) is None
+
+
+def test_commentary_plan_fallback_trims_over_limit_comment() -> None:
+    """上限を超えた感想は文の区切りで切り詰めて使う"""
+    plan = CommentaryPlan(
+        comment="えっ、今の何？ 本当に見間違いじゃないの？ ちょっと怖いかも。",
+        mode="reaction",
+        emotion="surprised",
+        intensity=0.9,
+        pace="fast",
+    )
+    fallback = commentary_plan_fallback(plan, advance_marker="triangle")
+    assert len(fallback.comment) <= 20
+    assert fallback.comment.startswith("えっ、今の何？")
+    assert commentary_plan_issue(fallback, advance_marker="triangle") is None
+
+
+def test_commentary_plan_fallback_keeps_valid_plan_untouched() -> None:
+    """問題のない案はフォールバックでも書き換えない"""
+    plan = CommentaryPlan(
+        comment="いや、そういうものなの？",
+        mode="quick",
+        emotion="amused",
+        intensity=0.3,
+        pace="normal",
+    )
+    assert commentary_plan_fallback(plan) == plan
 
 
 def test_parse_commentary_plan_repairs_missing_outer_braces() -> None:
