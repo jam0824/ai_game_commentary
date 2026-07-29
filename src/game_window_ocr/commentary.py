@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
 import re
@@ -34,9 +33,11 @@ from .cli import (
     parse_crop,
     prepare_ocr_image,
 )
+from . import memory_store
 from .persistent_ocr import PersistentNdlOcr
 from .obs_window import OBS_WINDOW_TITLE, ObsCaptureWindow
 from .subtitles import SrtSubtitleWriter
+from .vtube import VTubeStudioController
 from .windows import (
     WindowInfo,
     capture_client,
@@ -57,7 +58,12 @@ COMMENTARY_COMPACT_THRESHOLD = 200_000
 FUZZY_PREFIX_MIN_CHARS = 12
 FUZZY_PREFIX_MIN_COVERAGE = 0.8
 FUZZY_PREFIX_MAX_ERROR_RATE = 0.12
+LINE_DIFF_MATCH_RATIO = 0.8
+LINE_DIFF_MIN_PREVIOUS_COVERAGE = 0.6
 COMMENTARY_PLAN_REVISIONS = 3
+COMMENTARY_FALLBACK_COMMENT = (
+    "うん、なるほどね。ここからどう転がっていくのか、ちょっと気になるかも。"
+)
 CHOICE_PLAN_REVISIONS = 3
 OCR_INTERVAL = 0.5
 CHOICE_SPEECH_SIMILARITY_THRESHOLD = 0.88
@@ -1438,6 +1444,17 @@ def build_commentary_prompt(
         "→ extended / 『あ、これ証言と食い違ってるじゃん。"
         "さっきのアリバイ、かなり怪しくなってきたかも。』\n"
         "- 上の言い回しは雰囲気の見本。毎回コピーせず、場面に合わせて変える。\n\n"
+        "# Emotion\n"
+        "- calm: 平常の説明・情景・つなぎ。silentでは必ずこれ。\n"
+        "- amused: 面白い、可愛い、笑える、ニヤッとする場面。\n"
+        "- excited: 明るい急展開、成功、盛り上がり、テンションが上がる発見。"
+        "配信映えするので抑えずに使う。\n"
+        "- surprised: 予想外の出来事、突然の物音、驚きの事実。\n"
+        "- tense: 緊迫、不穏、危険が迫る場面。\n"
+        "- sad: 不憫、切ない、痛ましい、可哀想な出来事。素直に選んでよい。\n"
+        "- thoughtful: 推理、考察、疑問を掘り下げる場面。\n"
+        "- 発話するのにcalmを選ぶのは、本当に平常の内容のときだけ。"
+        "同じ感情ばかりが続くと単調になるので、場面が動いたら感情も動かす。\n\n"
         "# Delivery\n"
         "- emotionは calm/amused/excited/surprised/tense/sad/thoughtful "
         "から選ぶ。silentではcalm。\n"
@@ -1542,67 +1559,89 @@ def parse_commentary_plan(raw_text: str) -> CommentaryPlan:
     )
 
 
+def _commentary_comment_limit(mode: str, advance_marker: str) -> int:
+    if advance_marker == "book":
+        return 90
+    return {"reaction": 20, "quick": 35, "extended": 90}.get(mode, 90)
+
+
 def commentary_plan_issue(
     plan: CommentaryPlan,
     *,
     must_speak: bool = False,
     advance_marker: str = "unknown",
 ) -> str | None:
+    """Report only what makes a plan unusable, never a wording preference.
+
+    Every issue returned here costs an extra planner round trip mid-stream, so
+    style deviations belong in commentary_plan_style_notes instead.
+    """
     if must_speak and plan.mode == "silent":
         return "ページ終端で未発話のためsilentは禁止です"
-    if advance_marker == "triangle" and plan.mode == "quick":
-        return "通常の文字送りではquickを使いません"
     if plan.mode == "silent":
-        if plan.comment:
-            return "silentなのにcommentが空ではありません"
         return None
     if not plan.comment or plan.comment == "……。":
         return f"{plan.mode}なのに有効なcommentがありません"
+    limit = _commentary_comment_limit(plan.mode, advance_marker)
+    if len(plan.comment) > limit:
+        if advance_marker == "book":
+            return (
+                f"ページ終端の感想が{limit}文字を超えています"
+                f"（{len(plan.comment)}文字）"
+            )
+        return (
+            f"{plan.mode}の上限{limit}文字を超えています"
+            f"（{len(plan.comment)}文字）"
+        )
+    return None
+
+
+def commentary_plan_style_notes(
+    plan: CommentaryPlan,
+    *,
+    advance_marker: str = "unknown",
+) -> list[str]:
+    """Collect wording that drifted from the persona without blocking it.
+
+    These are recorded per turn so the persona prompt can be tuned from real
+    output later, rather than stalling a live session to re-roll a comment.
+    """
+    if plan.mode == "silent" or not plan.comment:
+        return []
+    notes: list[str] = []
     sentence_ends = len(re.findall(r"[。！？!?]+", plan.comment))
     if advance_marker == "book":
         if plan.mode == "reaction":
-            return "ページ終端ではreactionだけでなく2～3文の感想を話してください"
+            notes.append(
+                "ページ終端ではreactionだけでなく2～3文の感想が欲しい場面です"
+            )
         if len(plan.comment) < 28:
-            return (
+            notes.append(
                 "ページ終端の感想が28文字未満で短すぎます"
                 f"（{len(plan.comment)}文字）"
             )
-        if len(plan.comment) > 90:
-            return (
-                "ページ終端の感想が90文字を超えています"
-                f"（{len(plan.comment)}文字）"
-            )
         if sentence_ends < 2:
-            return "ページ終端の感想が1文だけです。2～3文にしてください"
-        if sentence_ends > 3:
-            return "ページ終端の感想が4文以上あります。2～3文にしてください"
+            notes.append("ページ終端の感想が1文だけです（2～3文が狙い）")
+        elif sentence_ends > 3:
+            notes.append("ページ終端の感想が4文以上あります（2～3文が狙い）")
         soft_ending = re.search(
             r"(?:よね|だね|かも|じゃない|かな|気がする|っぽい|でしょ|じゃん)"
             r"(?=[。！？!?…〜～ー]|$)",
             plan.comment,
         )
         if not soft_ending:
-            return "ページ終端の感想に、友達へ話しかける柔らかい語尾がありません"
-    else:
-        if plan.mode == "reaction":
-            limit = 20
-        elif plan.mode == "quick":
-            limit = 35
-        else:
-            limit = 90
-        if len(plan.comment) > limit:
-            return (
-                f"{plan.mode}の上限{limit}文字を超えています"
-                f"（{len(plan.comment)}文字）"
+            notes.append(
+                "ページ終端の感想に、友達へ話しかける柔らかい語尾がありません"
             )
+    else:
+        if advance_marker == "triangle" and plan.mode == "quick":
+            notes.append("通常の文字送りでquickを使っています")
         if plan.mode == "quick" and len(plan.comment) < 8:
-            return f"quickなのに8文字未満です（{len(plan.comment)}文字）"
-    if advance_marker != "book" and plan.mode in {"reaction", "quick"}:
-        if sentence_ends > 1:
-            return f"{plan.mode}なのに2文以上あります"
-    if advance_marker != "book" and plan.mode == "extended":
-        if sentence_ends > 2:
-            return "extendedなのに3文以上あります"
+            notes.append(f"quickなのに8文字未満です（{len(plan.comment)}文字）")
+        if plan.mode in {"reaction", "quick"} and sentence_ends > 1:
+            notes.append(f"{plan.mode}なのに2文以上あります")
+        if plan.mode == "extended" and sentence_ends > 2:
+            notes.append("extendedなのに3文以上あります")
     banned = (
         "本文では",
         "ゲーム内では",
@@ -1615,22 +1654,80 @@ def commentary_plan_issue(
         "気になる気配",
         "胸が熱くなる",
     )
-    found = next((phrase for phrase in banned if phrase in plan.comment), None)
-    if found:
-        return f"解説口調の禁止表現「{found}」を含んでいます"
+    notes.extend(
+        f"解説口調の禁止表現「{phrase}」を含んでいます"
+        for phrase in banned
+        if phrase in plan.comment
+    )
     nominal_ending = re.search(
         r"(予感|気配|印象|真相|正体|影|裏|謎)[。…!！?？]*$",
         plan.comment,
     )
     if nominal_ending:
-        return f"体言止め「{nominal_ending.group(1)}」で終わっています"
+        notes.append(f"体言止め「{nominal_ending.group(1)}」で終わっています")
     blunt_ending = re.search(
         r"(だな(?:あ|ぁ)?|だろ(?:う)?)(?=[。！？!?…〜～ー]|$)",
         plan.comment,
     )
     if blunt_ending:
-        return f"ぶっきらぼうな語尾「{blunt_ending.group(1)}」を含んでいます"
-    return None
+        notes.append(
+            f"ぶっきらぼうな語尾「{blunt_ending.group(1)}」を含んでいます"
+        )
+    return notes
+
+
+def _truncate_comment_to_limit(comment: str, limit: int) -> str:
+    """Cut at a sentence boundary so a trimmed comment still sounds finished."""
+    if len(comment) <= limit:
+        return comment
+    kept = ""
+    for sentence in re.findall(r"[^。！？!?]*[。！？!?]+|[^。！？!?]+$", comment):
+        if len(kept) + len(sentence) > limit:
+            break
+        kept += sentence
+    kept = kept.strip()
+    if kept:
+        return kept
+    return comment[: max(1, limit - 1)].strip() + "。"
+
+
+def commentary_plan_fallback(
+    plan: CommentaryPlan,
+    *,
+    must_speak: bool = False,
+    advance_marker: str = "unknown",
+) -> CommentaryPlan:
+    """Make a plan speakable after every revision attempt failed.
+
+    Stopping the session is worse than a slightly blunt comment, so the last
+    plan is repaired locally instead of raising.
+    """
+    mode = plan.mode
+    comment = plan.comment
+    emotion = plan.emotion
+    intensity = plan.intensity
+    pace = plan.pace
+    if mode == "silent":
+        if not must_speak:
+            return plan
+        mode = "quick"
+        comment = ""
+        emotion = "thoughtful"
+        intensity = 0.5
+        pace = "normal"
+    if not comment or comment == "……。":
+        comment = COMMENTARY_FALLBACK_COMMENT
+    comment = _truncate_comment_to_limit(
+        comment,
+        _commentary_comment_limit(mode, advance_marker),
+    )
+    return CommentaryPlan(
+        comment=comment,
+        mode=mode,
+        emotion=emotion,
+        intensity=intensity,
+        pace=pace,
+    )
 
 
 def apply_commentary_intensity_boost(
@@ -1814,7 +1911,87 @@ def _fuzzy_prefix_end(prefix: str, text: str) -> int | None:
     return best_end
 
 
-def extract_incremental_text(previous_text: str | None, current_text: str) -> str:
+def _screen_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _compact_line(line: str) -> str:
+    return "".join(char for char in line if not char.isspace())
+
+
+def _same_screen_line(first: str, second: str) -> bool:
+    """Judge whether two OCR lines render the same sentence."""
+    left = _compact_line(first)
+    right = _compact_line(second)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return SequenceMatcher(None, left, right).ratio() >= LINE_DIFF_MATCH_RATIO
+
+
+def _appended_lines(previous_text: str, current_text: str) -> str | None:
+    """Collect current lines absent from the previous screen, ignoring order.
+
+    NDLOCR reorders vertical-text lines between captures, which breaks the
+    prefix comparisons above even though the page merely gained a line. Diffing
+    per line instead of per character survives that shuffle.
+    """
+    previous_lines = _screen_lines(previous_text)
+    current_lines = _screen_lines(current_text)
+    if not previous_lines or not current_lines:
+        return None
+
+    unmatched_previous = list(previous_lines)
+    appended: list[str] = []
+    for current_line in current_lines:
+        match_index = next(
+            (
+                index
+                for index, previous_line in enumerate(unmatched_previous)
+                if _same_screen_line(previous_line, current_line)
+            ),
+            None,
+        )
+        if match_index is None:
+            appended.append(current_line)
+        else:
+            unmatched_previous.pop(match_index)
+
+    matched_previous = len(previous_lines) - len(unmatched_previous)
+    coverage = matched_previous / len(previous_lines)
+    if coverage < LINE_DIFF_MIN_PREVIOUS_COVERAGE:
+        # Too little carried over to call this the same page; the screen most
+        # likely turned over, so let the caller fall back to the whole text.
+        return None
+    if not appended:
+        return None
+    return "".join(appended).strip()
+
+
+def _drop_spoken_lines(current_text: str, spoken_text: str | None) -> str | None:
+    """Remove lines already narrated on this page from the fallback text."""
+    if not spoken_text:
+        return None
+    compact_spoken = _compact_line(spoken_text)
+    if not compact_spoken:
+        return None
+    remaining = [
+        line
+        for line in _screen_lines(current_text)
+        if _compact_line(line) not in compact_spoken
+    ]
+    if not remaining:
+        return None
+    return "".join(remaining).strip()
+
+
+def extract_incremental_text(
+    previous_text: str | None,
+    current_text: str,
+    *,
+    spoken_text: str | None = None,
+) -> str:
     current = collapse_visual_line_breaks(current_text)
     if not previous_text:
         return current
@@ -1824,6 +2001,14 @@ def extract_incremental_text(previous_text: str | None, current_text: str) -> st
         prefix_end = _fuzzy_prefix_end(previous, current)
     if prefix_end is not None:
         return current[prefix_end:].strip()
+    appended = _appended_lines(previous_text, current_text)
+    if appended is not None:
+        return appended
+    # Last resort: re-reading the screen is better than stalling the session,
+    # but never re-read what this page already narrated.
+    unspoken = _drop_spoken_lines(current_text, spoken_text)
+    if unspoken is not None:
+        return unspoken
     return current
 
 
@@ -1930,6 +2115,31 @@ def verify_choice_speech(
     )
 
 
+def _notify_vtube_emotion(
+    vtube: VTubeStudioController | None,
+    plan: Any,
+) -> None:
+    """VTubeモデルへ感情を伝える。失敗してもゲーム進行は止めない
+
+    emotionだけでなく強度と話し方も渡す。同じ感情でも「軽いツッコミ」と
+    「重大発見の絶叫」で動きの大きさが変わるようにするため。
+    modeを持たないプラン（選択・締め）は感情と強度だけ渡る。
+    """
+    if vtube is None:
+        return
+    try:
+        vtube.set_emotion(
+            getattr(plan, "emotion", "calm"),
+            intensity=getattr(plan, "intensity", None),
+            mode=getattr(plan, "mode", None),
+        )
+    except Exception as exc:
+        print(
+            f"警告: VTubeモデルへの感情反映に失敗しました: {exc}",
+            file=sys.stderr,
+        )
+
+
 class AudioSink:
     def __init__(
         self,
@@ -1937,6 +2147,7 @@ class AudioSink:
         *,
         playback: bool,
         defer_playback: bool = False,
+        on_playback_change: Callable[[bool], None] | None = None,
     ) -> None:
         self.path = path
         self.playback = playback
@@ -1944,6 +2155,23 @@ class AudioSink:
         self._wave: wave.Wave_write | None = None
         self._stream: Any = None
         self._playback_failed = False
+        self._on_playback_change = on_playback_change
+        self._playback_notified = False
+
+    def _notify_playback(self, playing: bool) -> None:
+        """口パク連動などの通知。失敗しても音声処理は止めない"""
+        if self._on_playback_change is None:
+            return
+        if playing == self._playback_notified:
+            return
+        self._playback_notified = playing
+        try:
+            self._on_playback_change(playing)
+        except Exception as exc:
+            print(
+                f"警告: 再生状態の通知に失敗しました: {exc}",
+                file=sys.stderr,
+            )
 
     def __enter__(self) -> AudioSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1985,21 +2213,28 @@ class AudioSink:
         if self._wave is None:
             raise RuntimeError("音声出力が開始されていません。")
         self._wave.writeframesraw(chunk)
-        if self._stream is not None:
+        if self._stream is not None and chunk:
+            # 通知はデバイスを開いた時ではなく最初の音を送る直前に出す。
+            # モデルが生成を始めるまでの無音の間に口が動かないようにするため
+            self._notify_playback(True)
             self._stream.write(chunk)
 
     def play_buffered(self, chunk: bytes) -> None:
         if self._stream is not None and chunk:
+            self._notify_playback(True)
             self._stream.write(chunk)
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            finally:
-                self._stream.close()
-        if self._wave is not None:
-            self._wave.close()
+        try:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                finally:
+                    self._stream.close()
+        finally:
+            self._notify_playback(False)
+            if self._wave is not None:
+                self._wave.close()
 
 
 class ResponsesCommentaryPlanner:
@@ -2228,12 +2463,14 @@ class RealtimeSpeechClient:
         voice: str,
         timeout: float,
         timeline_origin: float | None = None,
+        speaking_listener: Callable[[bool], None] | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.voice = voice
         self.timeout = timeout
         self.timeline_origin = timeline_origin
+        self.speaking_listener = speaking_listener
         self._ws: websocket.WebSocket | None = None
 
     def __enter__(self) -> RealtimeSpeechClient:
@@ -2327,6 +2564,7 @@ class RealtimeSpeechClient:
             wav_path,
             playback=playback,
             defer_playback=guarded_playback,
+            on_playback_change=self.speaking_listener,
         ) as sink:
             while True:
                 event = self._receive()
@@ -2721,6 +2959,13 @@ def _build_parser(
         "--no-obs-window",
         action="store_true",
         help="OBSのアプリ音声キャプチャ用ウィンドウを表示しません。",
+    )
+    parser.add_argument(
+        "--no-vtube",
+        action="store_true",
+        help=(
+            "VTube Studio連携（感情モーション・表情・口パク）を行いません。"
+        ),
     )
     parser.add_argument(
         "--after-enter-delay",
@@ -3132,37 +3377,15 @@ def _session_stop_reason(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary_path.replace(path)
+    memory_store.write_json_atomic(path, payload)
 
 
 def _read_json_object(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
-        raise ValueError(
-            f"既存の全体記憶を読み込めません: {path} ({exc})"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise ValueError(
-            f"既存の全体記憶がJSONオブジェクトではありません: {path}"
-        )
-    return payload
+    return memory_store.read_json_object(path)
 
 
 def _safe_title_memory_dir(memory_dir: Path, title: str) -> Path:
-    normalized = unicodedata.normalize("NFKC", title).strip()
-    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", normalized)
-    safe = re.sub(r"\s+", "_", safe).strip(" ._")[:80] or "game"
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
-    return memory_dir / f"{safe}_{digest}"
+    return memory_store.safe_title_memory_dir(memory_dir, title)
 
 
 def _load_prior_commentary_memory(
@@ -3311,6 +3534,7 @@ def _deliver_startup_message(
     generation_errors: list[str],
     response: TextResult | None,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     message = apply_ocr_replacements(message, replacements)
     startup_record = {
@@ -3340,6 +3564,7 @@ def _deliver_startup_message(
         intensity=0.6,
         pace="normal",
     )
+    _notify_vtube_emotion(vtube, plan)
     try:
         speech: SpeechResult | None = None
         speech_prompt = build_commentary_speech_prompt(
@@ -3455,6 +3680,7 @@ def _create_startup_message(
     persona: str,
     playback: bool,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     response: TextResult | None = None
     errors: list[str] = []
@@ -3500,6 +3726,7 @@ def _create_startup_message(
         generation_errors=errors,
         response=response,
         replacements=replacements,
+        vtube=vtube,
     )
 
 
@@ -3514,6 +3741,7 @@ def _deliver_closing_message(
     generation_errors: list[str],
     response: TextResult | None,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     plan = apply_closing_plan_replacements(plan, replacements)
     closing_record = {
@@ -3534,6 +3762,7 @@ def _deliver_closing_message(
         )
 
     print("締めの挨拶を再生しています...")
+    _notify_vtube_emotion(vtube, plan)
     try:
         speech = realtime.speak(
             phase="closing",
@@ -3590,6 +3819,7 @@ def _create_closing_message(
     persona: str,
     playback: bool,
     replacements: Sequence[tuple[str, str]] = (),
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     payload, response, errors = _generate_structured_with_retries(
         planner,
@@ -3624,6 +3854,7 @@ def _create_closing_message(
         generation_errors=errors,
         response=response,
         replacements=replacements,
+        vtube=vtube,
     )
 
 
@@ -3809,10 +4040,21 @@ def _create_session_memories(
         overall_memory["previous_memory_backup"] = str(backup_path)
     else:
         overall_memory["previous_memory_backup"] = None
+    try:
+        rollback_path = memory_store.backup_overall_memory(overall_path)
+    except OSError as exc:
+        rollback_path = None
+        print(
+            "警告: ロールバック用に1回前の全体記憶を退避できませんでした。"
+            f"今回の更新は取り消せません: {exc}",
+            file=sys.stderr,
+        )
     _write_json_atomic(overall_path, overall_memory)
     if backup_path is not None:
         print(f"初期化前の実況記憶バックアップ: {backup_path.resolve()}")
     print(f"全体の実況記憶: {overall_path.resolve()}")
+    if rollback_path is not None:
+        print(f"ロールバック用の1回前の記憶: {rollback_path.resolve()}")
 
 
 def _finalize_timed_session(
@@ -3825,6 +4067,7 @@ def _finalize_timed_session(
     persona: str,
     termination_reason: str,
     session_started_at: float,
+    vtube: VTubeStudioController | None = None,
 ) -> None:
     records = _collect_session_records(root)
     session_elapsed_seconds = max(
@@ -3841,6 +4084,7 @@ def _finalize_timed_session(
             persona=persona,
             playback=not args.no_playback,
             replacements=args.ocr_replacements,
+            vtube=vtube,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(
@@ -4053,9 +4297,20 @@ def main(argv: list[str] | None = None) -> int:
             ocr_engine = PersistentNdlOcr()
             print(f"NDLOCR初期化: {ocr_engine.initialization_seconds:.3f}秒")
         commentary_model = args.commentary_model
-        session_started_at = _wait_for_commentary_start(obs_window)
-        print(f"Realtime音声へ接続: {args.model} / voice={args.voice}")
         with ExitStack() as stack:
+            # VTube Studioの接続と初期設定は「開始」を押す前に済ませる。
+            # パラメータの割り当て確認でモデルの表情を一瞬振るので、
+            # 録画開始後にやると変顔が録画に入ってしまう
+            vtube: VTubeStudioController | None = None
+            if not args.no_vtube:
+                vtube = VTubeStudioController()
+                if vtube.start():
+                    stack.callback(vtube.stop)
+                else:
+                    # 接続失敗の警告はコントローラ側が表示済み。実況は継続する
+                    vtube = None
+            session_started_at = _wait_for_commentary_start(obs_window)
+            print(f"Realtime音声へ接続: {args.model} / voice={args.voice}")
             realtime = stack.enter_context(
                 RealtimeSpeechClient(
                     api_key=api_key,
@@ -4063,6 +4318,9 @@ def main(argv: list[str] | None = None) -> int:
                     voice=args.voice,
                     timeout=args.timeout,
                     timeline_origin=session_started_at,
+                    speaking_listener=(
+                        vtube.set_speaking if vtube is not None else None
+                    ),
                 )
             )
             planner: ResponsesCommentaryPlanner | None = None
@@ -4096,6 +4354,7 @@ def main(argv: list[str] | None = None) -> int:
                         persona=commentator_persona,
                         playback=not args.no_playback,
                         replacements=args.ocr_replacements,
+                        vtube=vtube,
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     print(
@@ -4352,7 +4611,11 @@ def main(argv: list[str] | None = None) -> int:
                         waited_seconds=advance_marker.waited_seconds,
                         retry_count=advance_marker.retry_count,
                     )
-                    turn_text = extract_incremental_text(last_text, text)
+                    turn_text = extract_incremental_text(
+                        last_text,
+                        text,
+                        spoken_text="".join(page_text_parts),
+                    )
                     if not turn_text:
                         turn_text = collapse_visual_line_breaks(text)
                         print(
@@ -4577,6 +4840,7 @@ def main(argv: list[str] | None = None) -> int:
                         f"意見: {choice_plan.opinion}"
                     )
                     print("意見と選択宣言を再生しています...")
+                    _notify_vtube_emotion(vtube, choice_plan)
                     choice_retry_ended_session = False
                     choice_termination_reason: str | None = None
                     try:
@@ -4708,7 +4972,11 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
                 print(f"\n[{turn_label}] OCR本文:\n{text}")
-                turn_text = extract_incremental_text(last_text, text)
+                turn_text = extract_incremental_text(
+                    last_text,
+                    text,
+                    spoken_text="".join(page_text_parts),
+                )
                 if not turn_text:
                     if (
                         live_timed_session
@@ -4885,11 +5153,24 @@ def main(argv: list[str] | None = None) -> int:
                             must_speak=must_speak,
                             advance_marker=advance_marker.kind,
                         )
+                    plan_fallback_applied = plan_issue is not None
                     if plan_issue is not None:
-                        raise RuntimeError(
-                            "感想案が実況タイミングの条件を満たせませんでした: "
-                            f"{plan_issue}。Enterは送りません。"
+                        commentary_plan = commentary_plan_fallback(
+                            commentary_plan,
+                            must_speak=must_speak,
+                            advance_marker=advance_marker.kind,
                         )
+                        print(
+                            "警告: 感想案が条件を満たせなかったため、"
+                            f"手元で整えて続けます: {plan_issue}",
+                            file=sys.stderr,
+                        )
+                    plan_style_notes = commentary_plan_style_notes(
+                        commentary_plan,
+                        advance_marker=advance_marker.kind,
+                    )
+                    for note in plan_style_notes:
+                        print(f"文体メモ: {note}")
                     commentary_plan, commentary_intensity_boosted = (
                         apply_commentary_intensity_boost(commentary_plan)
                     )
@@ -4904,6 +5185,9 @@ def main(argv: list[str] | None = None) -> int:
                     plan_record = {
                         **asdict(commentary_plan),
                         "intensity_boosted": commentary_intensity_boosted,
+                        "style_notes": plan_style_notes,
+                        "fallback_applied": plan_fallback_applied,
+                        "unresolved_issue": plan_issue,
                         "advance_marker": advance_marker.kind,
                         "page_has_spoken_before": page_has_spoken_before,
                         "must_speak": must_speak,
@@ -4929,6 +5213,7 @@ def main(argv: list[str] | None = None) -> int:
                         print("このターンは感想なしで進めます。")
                     else:
                         print("実況反応を演技付きで再生しています...")
+                        _notify_vtube_emotion(vtube, commentary_plan)
                         commentary = realtime.speak(
                             phase="commentary",
                             instructions=build_commentary_speech_prompt(
@@ -5062,6 +5347,7 @@ def main(argv: list[str] | None = None) -> int:
                         generation_errors=[str(exc)],
                         response=None,
                         replacements=args.ocr_replacements,
+                        vtube=vtube,
                     )
                     try:
                         _write_json_atomic(
@@ -5097,6 +5383,7 @@ def main(argv: list[str] | None = None) -> int:
                             persona=commentator_persona,
                             termination_reason=termination_reason,
                             session_started_at=session_started_at,
+                            vtube=vtube,
                         )
                     except (OSError, RuntimeError, ValueError) as exc:
                         print(
